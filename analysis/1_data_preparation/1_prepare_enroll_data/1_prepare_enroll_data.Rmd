@@ -1,0 +1,580 @@
+---
+title: "Prepare Enroll data"
+author: "Andrew Pollard"
+date: "23/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("here")
+library("arrow")
+library("dplyr")
+library("purrr")
+library("ggplot2")
+library("tidyr")
+library("magrittr")
+library("caret")
+library("GGally")
+
+source(here("src_R", "utils.R"))
+
+```
+
+This document is for preparing the Enroll-HD data
+for building Markov models.
+
+In particular, we want to select which variables will be used
+as the raw emission variables.
+This will involve selecting a shortlist of candidate variables,
+then assessing the data quality of these variables
+in order to decide which will be taken forward into the model.
+
+First, we'll remove the family controls
+and genotype negative subjects.
+We may use these to help us fit some of the model parameters,
+but obviously they don't display the disease progression
+that we're trying to model.
+
+```{r read_data, cache = TRUE}
+file_path <- here("data", "interim", "enroll-all.feather")
+enroll_data <- read_feather(file_path)
+```
+
+```{r select_variables_1, echo = TRUE}
+vars_to_select <- c(
+    "subjid",    # Subject ID
+    "visdy",     # Visit day (from baseline)
+    "age",       # Age at visit
+    "hdcat_0",   # Participant category at enrollment
+    "carelevl",  # Care level (0 = full-time skilled nursing, 1 = home or chronic care, 2 = home)
+    "occupatn",  # Occupation (0 = unable, 1 = marginal work only, 2 = reduced capacity for usual job, 3 = normal)
+    "carehome",  # 0 if patient is in a care home, 1 otherwise
+    "maristat",  # Marital status. 2 and 3 correspond to partnership and married, respectively.
+    "dssage",    # Age of death (years)
+    "rdcwkhw",   # How many fewer hours per week have you worked because of HD?
+    "bmi",       # Body mass index
+    "motscore",  # Motor assessment score
+    "tfcscore",  # Total Functional Capacity score
+    "fascore",   # Functional assessment score
+    "indepscl",  # Independence score
+    "sdmt1",     # Symbol digit modality test total correct
+    "verfct5",   # Verbal fluency test (category) total correct
+    "verfct6",   # Verbal fluency test (category) total intrusion errors
+    "verfct7",   # Verbal fluency test (category) total perseverative errors
+    "scnt1",     # Stroop colour naming test total correct
+    "scnt2",     # Stroop colour naming test total errors
+    "scnt3",     # Stroop colour naming test total self-corrected errors
+    "swrt1",     # Stroop word reading test total correct
+    "swrt2",     # Stroop word reading test total errors
+    "swrt3",     # Stroop word reading test total self-corrected errors
+    "sit1",      # Stroop interference test total correct
+    "sit2",      # Stroop interference test total errors
+    "sit3",      # Stroop interference test total self-corrected errors
+    "trla1",     # Trailmaking test part A time to complete
+    "trla2",     # Trailmaking test part A total correct
+    "trlb1",     # Trailmaking test part B time to complete
+    "trlb2",     # Trailmaking test part B total correct
+    "verflt05",  # Verbal fluency test (letters) total correct
+    "verflt06",  # Verbal fluency test (letters) total intrusion errors
+    "verflt07",  # Verbal fluency test (letters) total perseverative errors
+    "hvltt11",   # Hopkins verbal learning test trial 1 correct
+    "hvltt21",   # Hopkins verbal learning test trial 2 correct
+    "hvltt31",   # Hopkins verbal learning test trial 3 correct
+    "hvlt1",     # Hopkins verbal learning test delayed recall correct
+    "hvlt2",     # Hopkins verbal learning test total repetitions
+    "hvlt3",     # Hopkins verbal learning test total intrusions
+    "mdrs1",     # Dementia rating scale -- attention
+    "mdrs2",     # Dementia rating scale -- initiation/perseveration
+    "mdrs3",     # Dementia rating scale -- construction
+    "mdrs4",     # Dementia rating scale -- conceptualisation
+    "mdrs5",     # Dementia rating scale -- memory
+    "mmsetotal", # Mini mental state examination (MMSE) score
+    "tug1",      # Timed "up and go" total time
+    "scst1",     # 30-second chair stand test score
+    "depscore",  # Depression score
+    "irascore",  # Irritability aggression score
+    "psyscore",  # Psychosis score
+    "aptscore",  # Apathy score
+    "exfscore",  # Executive function score
+    "pf",        # Short form health survey 12v2 physical functioning
+    "rp",        # Short form health survey 12v2 Role-physical
+    "bp",        # Short form health survey 12v2 Bodily pain
+    "gh",        # Short form health survey 12v2 general health
+    "vt",        # Short form health survey 12v2 vitality
+    "sf",        # Short form health survey 12v2 social functioning
+    "re",        # Short form health survey 12v2 role-emotional
+    "mh",        # Short form health survey 12v2 mental health
+    "pcs",       # Short form health survey 12v2 physical component
+    "mcs",       # Short form health survey 12v2 mental component
+    "sfscore_v2", # Short form health survey 36v2 score
+    "sfscore_v1", # Short form health survey 36v1 score
+    "anxscore",  # HADS-SIS anxiety subscore
+    "hads_depscore", # HADS-SIS depression subscore
+    "irrscore",  # HADS-SIS irritability subscore
+    "outscore",  # HADS-SIS outward irritability subscore
+    "inwscore",  # HADS-SIS inward irritability subscore
+    "wpaiscr1",  # WPAI-SHP work time missed due to HD [%]
+    "wpaiscr2",  # WPAI-SHP impairment while working due to HD [%]
+    "wpaiscr3",  # WPAI-SHP overall work impairment due to HD [%]
+    "wpaiscr4",  # WPAI-SHP activity impairment due to HD [%]
+    "bdiscore",  # Beck depression inventory score
+    "behscore",  # Behavioural score
+    "behaviour_depscore", # Behaviour - depression sub-score
+    "defscore",  # Behaviour - Drive/executive function sub-score
+    "behaviour_irascore", # Behaviour - irritability/aggression sub-score
+    "behaviour_psyscore", # Behaviour - psychosis sub-score
+    "hamscore",  # Hamilton score
+    "sbh1n"     # Total number of suicide attempts
+)
+
+non_emission_vars <- c("subjid", "visdy", "age", "hdcat_0", "carelevl",
+                       "carehome", "occupatn", "maristat", "dssage")
+
+emission_vars <- setdiff(vars_to_select, non_emission_vars)
+
+enroll_data <- enroll_data %>%
+    select(!!vars_to_select) %>%
+    filter(hdcat_0 < 4)  # Remove family control/genotype negative
+```
+
+
+## Create more accurate age variable
+
+The data only records subjects' ages as an integer number of years.
+This will not be sufficient for use in the model,
+as it may appear as though no time has passed
+between observations up to a year apart.
+Therefore, we need to create a more accurate age variable
+using the age at their first visit
+and the visit day.
+
+Note that these ages don't need to be strictly correct,
+but the difference in ages between visits
+should be as accurate as possible.
+
+```{r calculate_age}
+days_per_year_avg <- 365.25
+enroll_data %<>%
+    group_by(subjid) %>%
+    arrange(subjid, visdy) %>%
+    mutate(age_new = first(age) + (visdy - first(visdy))/days_per_year_avg) %>%
+    ungroup()
+
+print(enroll_data %>% select(subjid, visdy, age, age_new), n = 20)
+
+enroll_data %<>%
+    select(-age) %>%
+    rename(age = age_new)
+```
+
+## Split into training and test sets
+
+We split the data into training and test sets by subject.
+Here are the first few rows of the training data:
+
+```{r train_test_split}
+
+set.seed(20210624)
+
+subjs <- unique(enroll_data$subjid)
+
+in_train <- createDataPartition(seq_along(subjs), p = 0.6, list = FALSE)
+
+subjs_train <- subjs[in_train]
+subjs_test <- subjs[-in_train]
+
+enroll_train <- enroll_data %>% filter(subjid %in% subjs_train)
+enroll_test <- enroll_data %>% filter(subjid %in% subjs_test)
+
+head(enroll_train)
+
+n_rows_train <- nrow(enroll_train)
+n_subjects_train <- length(subjs_train)
+
+```
+
+
+## Look at missing value counts
+
+```{r missing_values, fig.height = 20}
+missing_values_data <- enroll_train %>%
+    select(!!emission_vars) %>%
+    summarise(across(everything(), ~sum(is.na(.x)) / nrow(enroll_train))) %>% 
+    pivot_longer(
+        everything(),
+        names_to = "variable",
+        values_to = "prop_missing"
+    ) %>%
+    arrange(desc(prop_missing))
+
+g <- ggplot(missing_values_data, aes(x = variable, y = prop_missing)) +
+    geom_col() +
+    coord_flip() +
+    scale_x_discrete(limits = missing_values_data$variable) +
+    theme(text = element_text(size = 15))
+
+print(g)
+
+# Impose an upper bound for the proportion of missing values
+threshold_missing_vals <- 0.25
+
+```
+
+After removing variables with more than
+`r 100*threshold_missing_vals`% of values missing,
+the following are the variables that remain,
+and the first few rows of the remaining training data.
+
+```{r select_variables_2}
+
+vars_to_keep <- missing_values_data %>%
+    filter(prop_missing < threshold_missing_vals) %>%
+    pull(variable)
+
+vars_to_keep <- c(vars_to_keep, non_emission_vars)
+
+vars_to_keep
+
+# Remove rows containing missing values
+enroll_train_selected <- enroll_train %>%
+    select(!!vars_to_keep) %>%
+    select(order(colnames(.))) %>%  # arrange columns alphabetically
+    relocate(all_of(non_emission_vars))
+
+print(enroll_train_selected, n = 20, width = Inf)
+
+n_rows_remaining <- nrow(enroll_train_selected)
+n_subjects_remaining <- n_distinct(enroll_train_selected$subjid)
+```
+
+
+## Look at zero-value counts
+
+Examination of the above variables shows that
+some of them are zero for the majority of the time.
+Let's look at this in more detail.
+
+```{r prop_zero}
+zero_count_data <- enroll_train_selected %>%
+    select(!all_of(setdiff(non_emission_vars, "subjid"))) %>%
+    summarise(across(where(is.numeric),
+                     ~sum(.x == 0, na.rm = TRUE) / nrow(enroll_train_selected))) %>%
+    pivot_longer(everything(), names_to = "variable",
+                 values_to = "prop_zeros") %>%
+    arrange(prop_zeros)
+
+g <- ggplot(zero_count_data, aes(x = variable, y = prop_zeros)) +
+    geom_col() +
+    coord_flip() +
+    scale_x_discrete(limits = zero_count_data$variable) +
+    theme(text = element_text(size = 15))
+
+print(g)
+
+```
+
+The above plot shows that some variables have
+a large proportion of zero values,
+so are unlikely to provide useful information for the model.
+
+The plots below show the estimated densities of the age distribution
+in the groups for which the variable is equal to zero
+and not equal to zero.
+
+```{r plot_vars_vs_age}
+# Impose an upper bound for the proportion of zero values
+threshold_zero_vals <- 0.5
+vars_to_plot <- zero_count_data %>%
+    filter(prop_zeros >= threshold_zero_vals) %>%
+    pull(variable)
+
+plot_data <- enroll_train_selected %>%
+    select(age, !!vars_to_plot) %>%
+    drop_na() %>%
+    pivot_longer(!!vars_to_plot, names_to = "variable", values_to = "value") %>%
+    mutate(is_zero = value == 0)
+
+g <- ggplot(plot_data, aes(x = age)) +
+    geom_density(aes(colour = is_zero)) +
+    facet_wrap(vars(variable))
+
+print(g)
+
+```
+
+The above plots show little difference in the age distribution
+between visits with zero values
+and visits with non-zero values
+for most of these variables.
+
+Some which appear to have some noticeable difference
+between zero values and non-zero values
+include `aptscore` and `exfscore`.
+
+```{r select_variables_3}
+
+vars_to_keep <- zero_count_data %>%
+    filter(prop_zeros < threshold_zero_vals) %>%
+    pull(variable)
+
+vars_to_keep
+
+# Remove rows containing missing values
+enroll_train_selected %<>%
+    select(all_of(non_emission_vars), !!vars_to_keep) %>%
+    drop_na(!c("dssage", "maristat")) %>%
+    select(order(colnames(.))) %>%  # arrange columns alphabetically
+    relocate(all_of(non_emission_vars))
+
+print(enroll_train_selected, n = 20, width = Inf)
+
+emissions_data <- enroll_train_selected %>% select(!all_of(non_emission_vars))
+n_emissions <- ncol(emissions_data)
+
+n_rows_remaining <- nrow(enroll_train_selected)
+n_subjects_remaining <- n_distinct(enroll_train_selected$subjid)
+
+```
+
+Initially, we had `r n_rows_train` rows of data in the training set,
+comprising `r n_subjects_train` unique subjects.
+
+After removing variables with more than
+`r 100*threshold_zero_vals`% of values equal to zero,
+and subsequently dropping rows with missing values,
+we are left with `r n_emissions` emission variables,
+`r n_rows_remaining` rows of data
+comprising `r n_subjects_remaining` unique subjects.
+
+N.b., in order to use PCA,
+we need to remove rows with missing values,
+otherwise there will be no observed principal components
+for some rows.
+
+The number of zero values for the `motscore` variable is initially suspicious,
+but examination of the Data Dictionary shows that
+this is the only test for which a low score is good,
+i.e. a score of zero corresponds to full ability
+in all the motor assessments.
+
+If we were to leave in these values,
+it would mean modelling `motscore` as a simple Gaussian mixture
+would lead to very small or zero variances for some state(s),
+which may break some convenient modelling assumptions.
+On the other hand,
+if we remove rows with zero values,
+we are removing a substantial proportion of rows of data.
+
+
+## Distributions of emission variables
+
+We want to examine the distribution of the emission variables
+to check whether a Gaussian mixture approximation seems reasonable
+(which would be simple to implement,
+and would be ideal for PCA)
+or whether different approximations need to be made.
+
+In a hidden Markov model,
+the emissions have some distribution,
+conditional on the current state.
+Therefore,
+the distribution of an emission across the whole data set
+will be a mixture of distributions
+corresponding to different states.
+A simple and easy to handle case
+would be a mixture of Gaussians.
+So, here we look at the distributions of the emissions
+to see if they look like mixtures of Gaussians,
+or if it's possible to transform them
+into something that looks like a mixture of Gaussians.
+
+
+```{r emission_distributions}
+
+enroll_data_dist <- enroll_train_selected %>%
+    pivot_longer(!all_of(non_emission_vars),
+                 names_to = "variable",
+                 values_to = "value")
+
+g <- ggplot(enroll_data_dist, aes(x = value, after_stat(density))) +
+    geom_histogram(binwidth = 5) +
+    facet_wrap(vars(variable)) +
+    coord_cartesian(xlim = c(0, 100))
+
+print(g)
+
+```
+
+In addition to the already identified large number of zero values
+for the `motscor` variable,
+we can see from the above histograms that
+there are several variables that have a large spike in density
+at their maximum values. 
+This may be because, for example,
+an individual who is not yet suffering any ill effects from HD
+will almost always get a 100% independence score,
+so there will be at least one disease state for which the emission has
+zero or very small variance.
+It is not clear at this stage whether this presents a problem.
+
+One of the most non-Gaussian-mixture-looking variables is `fascore`.
+We'll try transforming this to something that can be modelled as Gaussian.
+
+The histogram below was obtained
+by applying the function $f$ to `fascore`,
+where
+
+$$
+f(x) = \log(1+x_\max-x),
+$$
+
+where $x_\max$ is the maximum value of $x$,
+i.e. the maximum value of `fascore` in the training data.
+
+```{r transforms}
+enroll_train_selected %<>%
+    mutate(fascore_trans = log1p(max(fascore) - fascore),
+           irascore_trans = log1p(irascore),
+           depscore_trans = log1p(depscore),
+           exfscore_trans = log1p(exfscore)) %>%
+    select(-fascore, -irascore, -depscore, -exfscore)
+
+g <- ggplot(enroll_train_selected, aes(x = fascore_trans)) +
+    geom_histogram(bins = 10)
+
+print(g)
+
+```
+
+The above histogram shows that
+the transformed variable is a more plausible mixture of Gaussians.
+Although there is still a clear peak, now at 0,
+the rest of the data looks more Gaussian.
+So, this transformed variable could correspond to a Gaussian mixture,
+for which one state has a mean at 0 and negligible variance,
+and other states have larger means and variances.
+
+Other variables that have significantly
+non-Gaussian-mixture-looking distributions are
+`depscore`, `irascore` and `exfscore`.
+We transform these using a log transformation:
+
+$$
+f(x) = \log(1+x)
+$$
+
+## Emissions correlations
+
+The heatmap below shows the Pearson correlation coefficients
+between the emission variables.
+
+```{r emissions_correlations, fig.height = 10, fig.width = 15}
+emissions_data <- enroll_train_selected %>%
+    select(!all_of(non_emission_vars))
+ggcorr(emissions_data,
+       method = c("pairwise", "pearson"),
+       nbreaks = 10,
+       label_round = 2,
+       hjust = 0.8,
+       label = TRUE,
+       label_size = 6,
+       size = 6,
+       layout.exp = 1,
+       color = "grey40"
+)
+```
+
+```{r select_enough_correlation_with_TFC}
+min_corr_with_TFC <- 0.1
+
+corr_data <- emissions_data %>%
+    summarise(across(everything(), ~cor(.x, tfcscore)))
+
+idx_not_enough_cor_with_tfc <- abs(corr_data) < min_corr_with_TFC
+
+vars_not_enough_cor_with_tfc <- names(corr_data)[idx_not_enough_cor_with_tfc]
+
+enroll_train_selected %<>%
+    select(!all_of(vars_not_enough_cor_with_tfc))
+
+emissions_data %<>%
+    select(!all_of(vars_not_enough_cor_with_tfc))
+
+```
+
+Unsurprisingly, many of the variables show strong correlations.
+
+As the variables are highly correlated,
+it is unlikely that feeding the raw emissions into `msm`
+will be successful.
+
+At this stage,
+we want to restrict our attention to
+variables which are most likely to be related
+to Huntington's disease progression.
+TFC is one of the major indicators of progression,
+and variables with very low correlation with TFC
+are unlikely to be of interest.
+Therefore,
+we remove variables whose Pearson correlation coefficient with TFC
+is less than `r min_corr_with_TFC`.
+
+## Principal components analysis
+
+This section presents PCA applied to the selected emission variables.
+We plan to apply PCA because
+it will allow us to transform the emission variables
+into variables that have no (or at least less) correlation,
+only a few of which need to be kept
+and fed into the `msm` fit.
+The `msm` package does not support correlated emission variables,
+and ignoring this would lead to very poor results
+(see analysis/3_msm_assessment/4_assess_msm_with_challenging_synthetic_data_set).
+So PCA would allow us to meet the requirements of `msm`
+and reduce the model complexity
+by reducing the dimensionality of the data.
+
+It may be that the covariance matrices --
+and therefore the principal components --
+of the emissions vary substantially between states,
+in which case PCA on the whole data set may give misleading results.
+However, it is likely that
+the covariance matrices of different states are quite similar,
+because much of the covariance will be due to things like:
+
+* cognitive assessments that are testing the same underlying thing,
+providing similar variability between subjects for all states.
+* assessments that are affected by things other than HD,
+such as tiredness,
+which will affect many assessments in a similar way,
+thus providing similar variability over time for all states. 
+
+```{r pca}
+pca_results <- prcomp(emissions_data, center = TRUE, scale. = TRUE)
+pca_plots <- generate_pca_plots(pca_results)
+
+print(pca_plots$var_plot)
+print(pca_plots$var_explained_plot)
+```
+
+The above results show that
+selecting the first 6 principal components
+will capture around 90% of the variance.
+This would be a significant dimension reduction,
+and would allow us to provide uncorrelated variables into the `msm` fit.
+
+
+## Save data
+
+```{r save_data, echo = TRUE}
+destination_dir <- here("data", "processed")
+write.csv(enroll_train_selected,
+          file.path(destination_dir, "enroll_all_train.csv"),
+          row.names = FALSE)
+write.csv(enroll_test,
+          file.path(destination_dir, "enroll_all_test.csv"),
+          row.names = FALSE)
+
+```

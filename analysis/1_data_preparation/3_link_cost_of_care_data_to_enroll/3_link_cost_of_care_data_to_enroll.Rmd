@@ -1,0 +1,841 @@
+---
+title: "Link cost of care data to Enroll"
+author: "Andrew Pollard"
+date: "23/07/2021"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("here")
+library("readxl")
+library("readr")
+library("dplyr")
+library("magrittr")
+library("ggplot2")
+
+source(here("src_R", "utils.R"))
+source(here("src_R", "survival.R"))
+source(here("src_R", "costs.R"))
+```
+
+This is a document for linking the cost of care data
+to the Enroll data,
+so that we can analyse
+the financial impact of Huntington's Disease.
+
+```{r read_cost_data}
+cost_data_path <- here("data", "raw", "cost_of_care.xlsx")
+cost_data <- read_excel(cost_data_path, sheet = "costs")
+
+head(cost_data)
+```
+
+
+## Read Enroll visit data
+
+```{r read_enroll_data}
+enroll_visit_train_path <- here("data", "processed", "enroll_all_train.csv")
+enroll_visit_train_data <- read_csv(enroll_visit_train_path)
+
+head(enroll_visit_train_data)
+```
+
+```{r find_last_visits}
+last_visits <- enroll_visit_train_data %>%
+    group_by(subjid) %>%
+    summarise(last_visit = max(visdy))
+```
+
+
+## Read therapy data
+
+### Pharmacologic therapies
+
+```{r read_pharmacotx_data}
+# The following values represent missing or invalid data,
+# so we'll replace these with NA
+coded_missing <- c(9996, 9997, 9998)
+
+pharmacotx_data_path <- here("data", "raw", "pharmacotx.csv")
+pharmacotx_data <- read_tsv(pharmacotx_data_path) %>%
+    mutate(across(where(is.numeric),
+                  ~ifelse(.x %in% coded_missing, NA, .x))) %>%
+    select(subjid, cmtrt__modify, cmtrt__ing, cmindc__modify, cmdostot,
+           cmdose__cmdosu, cmdosfrq, cmroute, cmstdy, cmendy) %>%
+    filter(subjid %in% enroll_visit_train_data$subjid) %>%  # Only subjects in training set
+    drop_na(subjid, cmdostot, cmdose__cmdosu, cmdosfrq, cmstdy, cmendy)
+
+pharmacotx_data %<>%
+    mutate(cmdose__cmdosu = str_replace_all(cmdose__cmdosu, c("milligram" = "mg",
+                                                              "gram" = "g",
+                                                              "μ g" = "microgram",
+                                                              "μg" = "microgram",
+                                                              "microg" = "microgram",
+                                                              "unit" = "IU")))
+
+n_rows_pharmacotx_original <- nrow(pharmacotx_data)
+head(pharmacotx_data)
+```
+
+
+### Non-pharmacologic therapies
+
+```{r read_nonpharmacotx_data}
+nonpharmacotx_data_path <- here("data", "raw", "nonpharmacotx.csv")
+nonpharmacotx_data <- read_tsv(nonpharmacotx_data_path) %>%
+    mutate(across(where(is.numeric),
+                  ~ifelse(.x %in% coded_missing, NA, .x))) %>%
+    filter(subjid %in% enroll_visit_train_data$subjid) %>%  # Only subjects in training set
+    drop_na(cmtrt, cmfrq, cmdosfrq, cmstdy, cmenrf)
+
+head(nonpharmacotx_data)
+```
+
+### Read therapy-service mapping data
+
+This maps each therapy
+to a therapeutic service area,
+and matches it up with the encoding used in Enroll.
+
+```{r read_therapy_service_map}
+therapy_service_map_data <- read_excel(cost_data_path,
+                                       sheet = "therapies")
+
+therapy_service_map_data
+```
+
+```{r link_therapy_codes_to_services}
+nonpharmacotx_data %<>%
+    left_join(therapy_service_map_data, by = c("cmtrt" = "enroll_code"))
+
+print(nonpharmacotx_data, n = 10)
+```
+
+```{r survival_fits}
+
+surv_fits_nonpharmacotx <- nonpharmacotx_data %>%
+    prepare_survival_data(last_visits) %>%
+    group_by(therapy) %>%
+    mutate(surv_obj = Surv(surv_time, event)) %>%
+    summarise(collect_surv_outputs(surv_obj))
+
+```
+
+```{r plot_survival_fits}
+surv_fits_plot <- ggplot(surv_fits_nonpharmacotx, aes(x = time)) +
+    geom_step(aes(y = surv, colour = therapy)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper, fill = therapy), alpha = 0.2)
+
+print(surv_fits_plot)
+
+```
+
+
+### Get quantities of solid drugs 
+
+```{r read_prescription_cost_data}
+prescr_cost_data_path <- here("data", "raw", "pca_summary_tables_2020_21_v001.xlsx")
+prescr_cost_data <- read_excel(prescr_cost_data_path,
+                               sheet = "Presentations",
+                               skip = 2) %>%
+    drop_na(`Generic Presentation Name`)
+
+head(prescr_cost_data)
+```
+
+```{r get_solid_quantities, cache = TRUE}
+# For medicines measures in grams/mg/micrograms,
+# extract the mass of each tablet/capsule and the unit.
+continuous_solid_units <- c("g", "mg", "microgram", "IU")
+discrete_solid_units <- c("tablet", "pill", "capsule")
+
+prescr_cost_data %<>%
+    mutate(extract_quantities(`Generic Presentation Name`)) %>%
+    filter(sapply(amount, length) == 1) %>%
+    mutate(amount = unlist(amount),
+           unit = unlist(unit)) %>%
+    filter(unit %in% c(continuous_solid_units, discrete_solid_units)) %>%
+    mutate(amount_per_item = `Quantity Per Item` * amount) %>%
+    drop_na()
+
+print(prescr_cost_data, n = 6, width = Inf)
+```
+
+
+## Link pharmacologic therapies in Enroll to costs
+
+For medications that are measured in grams/mg/micrograms,
+we use the dose and the dose frequency
+to calculate the amount each patient is taking per month,
+so that we can subsequently calculate
+the cost of that medication per month.
+
+We drop medications that are taken "as needed",
+as we can't convert this into
+a justifiable quantity per month.
+
+```{r amount_per_month}
+# Get amount per month of medication
+days_per_year_avg <- 365.25
+months_per_year <- 12
+days_per_month_avg <- days_per_year_avg / months_per_year
+days_per_week <- 7
+
+pharmacotx_data %<>%
+    mutate(amount_per_month = case_when(
+        cmdosfrq == 1 ~ cmdostot * days_per_month_avg,  # daily
+        cmdosfrq == 2 ~ cmdostot * days_per_month_avg / 2,  # every 2nd day
+        cmdosfrq == 3 ~ cmdostot * days_per_month_avg / 3,  # every 3rd day
+        cmdosfrq == 4 ~ cmdostot * days_per_month_avg / days_per_week,  # weekly
+        cmdosfrq == 5 ~ cmdostot * days_per_month_avg / days_per_week / 2,  # every 2nd week
+        cmdosfrq == 6 ~ cmdostot,  # monthly
+        cmdosfrq == 7 ~ cmdostot / 2,  # every 2nd month
+        cmdosfrq == 8 ~ cmdostot / 3,  # every 3rd month
+        cmdosfrq == 9 ~ cmdostot / months_per_year,  # annually,
+        TRUE ~ NA_real_  # Can't turn 10 (= "as needed") into an amount per month
+    )) %>%
+    drop_na(amount_per_month)
+
+prop_amounts_found <- nrow(pharmacotx_data) / n_rows_pharmacotx_original
+```
+
+Due to missing values,
+and the decision to drop the "as needed" drugs,
+we can find the amount taken per month of
+`r round(prop_amounts_found * 100)`% of medications.
+
+We then link this medication data
+to the NHS prescriptions cost analysis data.
+
+```{r link_meds_to_costs, cache = TRUE}
+med_costs_data <- pharmacotx_data %>%
+    mutate(cmtrt__modify = str_to_lower(cmtrt__modify)) %>%
+    group_by(cmtrt__modify) %>%
+    summarise(chem = first(str_to_lower(cmtrt__ing)), .groups = "drop_last") %>%
+    mutate(mass_per_item = lapply(seq_along(chem),
+                                  function(i) list()),
+           cost_per_item = mass_per_item,
+           quantity_per_item = mass_per_item,
+           unit = mass_per_item,
+           n_items_country = mass_per_item,
+           is_inj = mass_per_item,
+           is_implant = mass_per_item)
+
+pca_chem <- str_to_lower(prescr_cost_data$`BNF Chemical Substance Name`)
+pca_product <- str_to_lower(prescr_cost_data$`BNF Presentation Name`)
+
+for (i_chem in seq_along(med_costs_data$chem)) {
+    # Try to find the chemical substance in the prescriptions cost data.
+    # First look for exact matches of product name,
+    # then product name appearing as a word in the prescriptions cost data,
+    # then check for exact match of chemical substance, then
+    # check for the chemical substance name from the prescriptions cost data
+    # appearing as a substring in the Enroll data, or vice versa.
+    
+    idx_match <- which(med_costs_data$cmtrt__modify[i_chem] == pca_product)
+    
+    if (length(idx_match) == 0) {
+        idx_match <- which(sapply(str_split(pca_product, boundary("word")),
+                                  function(x) {
+                                      any(med_costs_data$cmtrt__modify[i_chem] %in% x)
+                                  }))
+    }
+    
+    if (length(idx_match) == 0) {
+        idx_match <- which(med_costs_data$chem[i_chem] == pca_chem)
+    }
+    
+    if (length(idx_match) == 0) {
+        idx_match <- which(
+            str_detect(med_costs_data$chem[i_chem], pca_chem) |
+                str_detect(pca_chem, med_costs_data$chem[i_chem])
+        )
+    }
+    
+    # Check whether injection, as this affects cost hugely
+    med_costs_data$is_inj[[i_chem]] <- str_detect(
+        prescr_cost_data$`BNF Presentation Name`[idx_match],
+        " inj "
+    )
+    
+    # Check whether implant, as this affects cost hugely
+    med_costs_data$is_implant[[i_chem]] <- str_detect(
+        prescr_cost_data$`BNF Presentation Name`[idx_match],
+        "implant"
+    )
+    
+    if (length(idx_match) > 0) {
+        med_costs_data$mass_per_item[[i_chem]] <- prescr_cost_data$amount_per_item[idx_match]
+        med_costs_data$quantity_per_item[[i_chem]] <-
+            prescr_cost_data$`Quantity Per Item`[idx_match]
+        med_costs_data$cost_per_item[[i_chem]] <-
+            prescr_cost_data$`Cost Per Item (GBP)`[idx_match]
+        med_costs_data$unit[[i_chem]] <- prescr_cost_data$unit[idx_match]
+        med_costs_data$n_items_country[[i_chem]] <- prescr_cost_data$`Total Items`[idx_match]
+    }
+}
+
+med_costs_data %<>% drop_na()
+
+# Ignore meds for which we can't work out the price at the moment
+pharmacotx_data %<>% filter(str_to_lower(cmtrt__modify) %in% med_costs_data$cmtrt__modify)
+
+```
+
+
+## Calculate number of prescriptions and costs per month
+
+### Dealing with multiple matches
+
+Some chemical ingredients in the Enroll therapies data
+have multiple matches
+in the prescriptions cost analysis.
+To deal with this,
+we calculate the total cost per month for each possibility,
+and average them out.
+
+To average them out,
+we can look at the total number of prescriptions sold for each product,
+and take the mean cost assuming
+the probability of the patient having a product
+is proportional to the total number of prescriptions sold for that product.
+
+```{r prescriptions_costs_per_month, cache = TRUE}
+
+pharmacotx_data %<>%
+    mutate(cmtrt__ing = str_to_lower(cmtrt__ing),
+           cmtrt__modify = str_to_lower(cmtrt__modify)) %>%
+    left_join(med_costs_data, by = "cmtrt__modify") %>%
+    mutate(cost_per_month_all = lapply(seq_len(nrow(pharmacotx_data)),
+                                       function(i) list()),
+           expected_cost_per_month = NA,
+           items_per_month_all = list(NULL),
+           items_per_month_expected = NA)
+
+for (i_row in seq_len(nrow(pharmacotx_data))) {
+    # Drop meds with different units for simplicity
+    if (pharmacotx_data$cmdose__cmdosu[i_row] %in% discrete_solid_units) {
+        is_keep <- rep.int(TRUE, length(pharmacotx_data$unit[[i_row]]))
+    } else {
+        is_keep <- pharmacotx_data$unit[[i_row]] ==
+            pharmacotx_data$cmdose__cmdosu[i_row]
+    }
+    
+    # Check for injections
+    if (!is.na(pharmacotx_data$cmroute[i_row])) {
+        if (pharmacotx_data$cmroute[i_row] == 4) {
+            is_keep <- is_keep & pharmacotx_data$is_inj[[i_row]]
+        } else {
+            is_keep <- is_keep & !pharmacotx_data$is_inj[[i_row]]
+        }
+    }
+    
+    # Check for implants
+    if (str_detect(pharmacotx_data$cmtrt__modify[i_row], "implant")) {
+        is_keep <- is_keep & pharmacotx_data$is_implant[[i_row]]
+    } else {
+        is_keep <- is_keep & !pharmacotx_data$is_implant[[i_row]]
+    }
+    
+    pharmacotx_data$unit[[i_row]] <- pharmacotx_data$unit[[i_row]][is_keep]
+    pharmacotx_data$mass_per_item[[i_row]] <-
+        pharmacotx_data$mass_per_item[[i_row]][is_keep]
+    pharmacotx_data$cost_per_item[[i_row]] <-
+        pharmacotx_data$cost_per_item[[i_row]][is_keep]
+    pharmacotx_data$n_items_country[[i_row]] <-
+        pharmacotx_data$n_items_country[[i_row]][is_keep]
+    pharmacotx_data$quantity_per_item[[i_row]] <-
+        pharmacotx_data$quantity_per_item[[i_row]][is_keep]
+    
+    if (pharmacotx_data$cmdose__cmdosu[i_row] %in% discrete_solid_units) {
+        # Amount is number of tablets/pills etc.
+        pharmacotx_data$items_per_month_all[[i_row]] <-
+            pharmacotx_data$amount_per_month[i_row] /
+            pharmacotx_data$quantity_per_item[[i_row]]
+    } else {
+        # Amount is mass. We made sure the units match, so we can divide.
+        pharmacotx_data$items_per_month_all[[i_row]] <-
+            pharmacotx_data$amount_per_month[i_row] /
+            pharmacotx_data$mass_per_item[[i_row]]
+    }
+    
+    pharmacotx_data$cost_per_month_all[[i_row]] <- pharmacotx_data$cost_per_item[[i_row]] *
+        pharmacotx_data$items_per_month_all[[i_row]]
+    
+    pharmacotx_data$expected_cost_per_month[i_row] <-
+        sum(pharmacotx_data$n_items_country[[i_row]] *
+                pharmacotx_data$cost_per_month_all[[i_row]]) /
+        sum(pharmacotx_data$n_items_country[[i_row]])
+    
+    pharmacotx_data$items_per_month_expected[i_row] <-
+        sum(pharmacotx_data$n_items_country[[i_row]] *
+                pharmacotx_data$items_per_month_all[[i_row]]) /
+        sum(pharmacotx_data$n_items_country[[i_row]])
+}
+
+pharmacotx_data %<>% drop_na(expected_cost_per_month)
+
+# If number of items per month is very high,
+# something has gone wrong --
+# many of these are misspecification of dose unit,
+# e.g. mg instead of micrograms.
+# Drop these rather than guess dose unit.
+max_items_per_month <- 10
+
+pharmacotx_data %<>% filter(items_per_month_expected <= max_items_per_month)
+
+prop_costs_found <- nrow(pharmacotx_data) / n_rows_pharmacotx_original
+
+```
+
+### Dealing with erroneous dose data
+
+Some dosage data in Enroll contains errors,
+e.g. dose units recorded as milligrams
+instead of micrograms.
+This can lead to erroneously high costs.
+We can detect these errors by looking at
+the number of prescription items (packs)
+the patient receives each month.
+If the dose unit is misspecified,
+this value will be unreasonably high.
+We filter these out by
+removing medications for which
+the patient apparently receives more than
+`r max_items_per_month` prescription items per month.
+
+
+### First few results
+
+The above approach allows us to find
+expected monthly costs for
+`r round(prop_costs_found * 100)`% of medications
+in the Enroll training set.
+
+
+First few...
+
+* chemical ingredients:
+
+```{r ingred}
+pharmacotx_data$cmtrt__ing[1:5]
+```
+
+* costs per month for all matched products: 
+
+```{r cost_per_month_all}
+pharmacotx_data$cost_per_month_all[1:5]
+```
+
+* expected costs per month:
+
+```{r cost_per_month_exp}
+pharmacotx_data$expected_cost_per_month[1:5]
+```
+
+* prescription items per month for all matched products:
+
+```{r items_per_month_all}
+pharmacotx_data$items_per_month_all[1:5]
+```
+
+* expected prescription items per month:
+
+```{r items_per_month_exp}
+pharmacotx_data$items_per_month_expected[1:5]
+```
+
+We calculate the cost to the patient
+in the case that the patient pays for their prescriptions.
+
+```{r cost_to_patient}
+prepayment_cost_per_month <- cost_data %>%
+    filter(item == "NHS prescription prepayment 12 month") %>%
+    pull(cost_typical_gbp) / months_per_year
+
+```
+
+Here we assume that the patient uses
+a 12-month prescription prepayment,
+and therefore the monthly cost is £`r round(prepayment_cost_per_month, 2)`.
+
+
+## Show most costly drugs
+
+Calculate the total amount spent on each drug
+by patients in the Enroll training set.
+
+```{r total_costs_by_drug}
+
+pharmacotx_data %<>%
+    use_last_visit_as_end_date(last_visits) %>%
+    mutate(
+        total_cost = (expected_cost_per_month / days_per_month_avg) *
+            (cmendy - cmstdy)
+    )
+```
+
+### By product
+
+```{r plot_drug_costs}
+n_subjs <- n_distinct(enroll_visit_train_data$subjid)
+
+cost_by_product_plot <- plot_medication_costs(pharmacotx_data, "cmtrt__modify",
+                                              n_subjs)
+
+print(cost_by_product_plot)
+```
+
+### By active ingredient
+
+```{r plot_drug_costs_ingredient}
+
+cost_by_ingr_plot <- plot_medication_costs(pharmacotx_data, "cmtrt__ing", n_subjs)
+
+print(cost_by_ingr_plot)
+```
+
+### By indication
+
+N.b. the plot below shows the cost of drugs
+by the indication given in the Enroll data.
+The Enroll data only records one indication per drug,
+even though some drugs may be used
+to treat multiple indications.
+The secondary indications that may also treated by the drugs
+are therefore not included in this cost analysis.
+
+```{r plot_drug_costs_indication}
+
+cost_by_indication_plot <- plot_medication_costs(pharmacotx_data, "cmindc__modify",
+                                                 n_subjs)
+
+print(cost_by_indication_plot)
+```
+
+
+## Calculate non-pharmacologic therapy sessions and costs per month
+
+We drop therapies that are given "as needed",
+as we can't convert this into
+a justifiable quantity per month.
+
+There are some unclear rows in the data.
+For example,
+a patient apparently has physical therapy
+at a frequency of 24 times a week
+over the period of 1 day.
+It is not clear exactly what this means.
+Therefore,
+we drop rows for which the time unit used in the frequency
+is longer than the total period
+in which the treatment was given.
+
+For therapies for which
+we don't have an average cost per session,
+we look at the unit costs of professionals
+in each salary band,
+and weight these with the number of
+"scientific, therapeutic and technical" staff
+in each of the salary bands
+(data on staff numbers is from 30-Sep-2017
+--  see NPD/10724/TD/TL/007).
+We apply a minimum and maximum band
+to each kind of therapy
+based on the job titles
+observed in the unit costs data.
+
+```{r n_sessions}
+
+nonpharmacotx_data %<>%
+    group_by(subjid) %>%
+    use_last_visit_as_end_date(last_visits) %>%
+    ungroup() %>%
+    mutate(
+        n_days_freq = case_when(
+            cmdosfrq == 1 ~ 1,  # Daily
+            cmdosfrq == 2 ~ days_per_week,  # Weekly
+            cmdosfrq == 3 ~ days_per_month_avg,  # Monthly
+            TRUE ~ NA_real_
+        ),
+        n_sessions_per_month = ifelse(n_days_freq < cmendy - cmstdy + 1,
+                                      cmfrq * days_per_month_avg / n_days_freq,
+                                      NA_real_)
+    ) %>%
+    drop_na()
+```
+
+
+### Read salary band data
+
+```{r read_band_data}
+band_data <- read_excel(cost_data_path, sheet = "bands")
+
+band_data
+```
+
+### Read staff numbers data
+
+```{r read_staff_numbers_data}
+staff_numbers_data_path <- here(
+    "data",
+    "raw",
+    "ah2288_hchs-staff-excluding-doctors-by-afc--staff-group.xlsx"
+)
+
+staff_numbers_data <- read_excel(staff_numbers_data_path, skip = 4, n_max = 17) %>%
+    drop_na()
+
+staff_numbers_data
+```
+
+
+### Calculate hourly costs for services
+
+```{r hourly_costs_for_services}
+# Get hourly costs for services based on the range of salary bands
+band_costs_data <- cost_data %>% filter(str_detect(item, "band"))
+
+for (i_row in seq_len(nrow(band_data))) {
+    low_band <- paste0("Band ", band_data$low_band[i_row])
+    high_band <- paste0("Band ", band_data$high_band[i_row])
+    
+    idx_rows <- seq(which(staff_numbers_data$`AfC Band` == low_band),
+                    which(staff_numbers_data$`AfC Band` == high_band))
+    weights <- staff_numbers_data$`Scientific, therapeutic & technical staff`[idx_rows]
+    weights <- weights / sum(weights)
+    
+    weights_data <- tibble(band = str_to_lower(staff_numbers_data$`AfC Band`[idx_rows]),
+                           weight = weights)
+    
+    weights_data %<>% 
+        left_join(band_costs_data, by = c("band" = "item")) %>%
+        summarise(cost_typical_gbp = sum(weight * cost_typical_gbp))
+    
+    cost_data %<>%
+        bind_rows(tibble(item = band_data$service[i_row],
+                         cost_typical_gbp = weights_data$cost_typical_gbp,
+                         cost_per = "hour"))
+    
+}
+
+therapy_costs <- cost_data %>%
+    filter(item %in% therapy_service_map_data$service) %>%
+    select(-cost_low_gbp, -cost_high_gbp)
+
+print(therapy_costs, width = Inf)
+
+```
+
+### Calculate total cost of therapies
+
+```{r calculate_therapy_costs}
+n_sessions_per_month_max <- 4
+
+nonpharmacotx_data %<>%
+    left_join(therapy_costs, by = c("service" = "item")) %>%
+    mutate(
+        n_sessions_per_month = pmin(n_sessions_per_month,
+                                    n_sessions_per_month_max),
+        expected_cost_per_month = ifelse(
+            cost_per %in% c("session", "hour"),
+            cost_typical_gbp * n_sessions_per_month,  # Assume sessions are 1 hour
+            NA_real_
+        ),
+        expected_total_cost = expected_cost_per_month / days_per_month_avg *
+            (cmendy - cmstdy + 1)
+    ) %>%
+    drop_na(expected_total_cost)
+
+print(nonpharmacotx_data, n = 6, width = Inf)
+```
+
+### Handling of erroneous data
+
+There are some erroneous entries
+in the non-pharmacologic therapy data
+that we need to deal with.
+In particular,
+a large number of the `cmfrq` variable records
+appear to have been recorded incorrectly
+(apparently implying patients receive a therapy
+thousands of times per day).
+
+This may be due to an ambiguity
+in the definitions of the variables.
+`cmfrq` is defined as "number of times",
+while `cmdosfrq` is defined as "Frequency",
+and can be "daily", "weekly", "monthly" or "as needed".
+It appears that some people have interpreted "number of times" to mean
+"number of times per (day/week/month)"
+according to the frequency `cmdosfrq`,
+while some may have interpreted it as
+"number of times in total".
+
+We deal with this by asserting that
+the number of therapy sessions per month
+is at most `r n_sessions_per_month_max`.
+
+Numbers of sessions greater than this value
+are reduced to `r n_sessions_per_month_max`.
+
+
+### Summary of average costs per patient
+
+N.b. This shows the average cost of each therapy
+over all patients in the training data,
+not just patients who had that therapy.
+
+```{r plot_costs_by_therapy}
+plot_data <- nonpharmacotx_data %>%
+    group_by(therapy) %>%
+    summarise(avg_cost_per_patient = sum(expected_total_cost) / n_subjs,
+              .groups = "drop_last") %>%
+    arrange(avg_cost_per_patient)
+
+costs_by_therapy_plot <- ggplot(plot_data, aes(x = therapy,
+                                               y = avg_cost_per_patient)) +
+    geom_col() +
+    coord_flip() +
+    scale_x_discrete(limits = plot_data$therapy) +
+    theme(text = element_text(size = 15)) +
+    labs(y = "Cost incurred so far by \n the average patient in Enroll (GBP)")
+
+print(costs_by_therapy_plot)
+```
+
+
+## Relate therapies to visits
+
+We want to work out which therapies are being used
+at each visit.
+We can do this by comparing
+the date range in which each medication was taken
+with the date of the visit.
+
+```{r therapies_by_visit, cache = TRUE}
+enroll_visit_train_data %<>%
+    mutate(meds = lapply(seq_len(nrow(enroll_visit_train_data)),
+                         function(i) list()),
+           expected_cost_per_month_pharma = meds,
+           items_per_month_expected = meds,
+           therapies = meds,
+           expected_cost_per_month_nonpharma = meds
+    )
+
+
+for (subj in unique(enroll_visit_train_data$subjid)) {
+    visit_data_this_subj <- enroll_visit_train_data %>% filter(subjid == subj)
+    
+    pharmacotx_data_this_subj <- pharmacotx_data %>%
+        filter(subjid == subj) %>%
+        mutate(cmendy = ifelse(is.na(cmendy), Inf, cmendy))
+    
+    nonpharmacotx_data_this_subj <- nonpharmacotx_data %>%
+        filter(subjid == subj) %>%
+        mutate(cmendy = ifelse(is.na(cmendy), Inf, cmendy))
+    
+    for (visdy in visit_data_this_subj$visdy) {
+        idx_visit <- which(enroll_visit_train_data$subjid == subj &
+                               enroll_visit_train_data$visdy == visdy)
+        
+        applicable_rows <- pharmacotx_data_this_subj %>%
+            filter(cmstdy <= visdy, visdy <= cmendy)
+        enroll_visit_train_data$meds[[idx_visit]] <- applicable_rows %>%
+            pull(cmtrt__ing)
+        enroll_visit_train_data$expected_cost_per_month_pharma[[idx_visit]] <-
+            applicable_rows %>%
+            pull(expected_cost_per_month)
+        
+        applicable_rows <- nonpharmacotx_data_this_subj %>%
+            filter(cmstdy <= visdy, visdy <= cmendy)
+        enroll_visit_train_data$therapies[[idx_visit]] <- applicable_rows %>%
+            pull(therapy)
+        enroll_visit_train_data$expected_cost_per_month_nonpharma[[idx_visit]] <-
+            applicable_rows %>%
+            pull(expected_cost_per_month)
+    }
+}
+
+```
+
+```{r calculate_total_costs}
+enroll_visit_train_data %<>%
+    mutate(across(starts_with("expected_cost_per_month_"),
+                  function(x) sapply(x, function(y) ifelse(length(y) > 0,
+                                                           Reduce("+", y),
+                                                           0)),
+                  .names = "total_{.col}"))
+
+enroll_visit_train_data %>%
+    select(subjid, visdy, meds, expected_cost_per_month_pharma,
+           total_expected_cost_per_month_pharma,
+           therapies, expected_cost_per_month_nonpharma,
+           total_expected_cost_per_month_nonpharma) %>%
+    print(n = 20, width = Inf)
+```
+
+
+## Relate other costs to visits
+
+### Costs related purely to TFC
+
+```{r plot_TFC_thresholds, fig.width = 12}
+benefit_thresholds_path <- here("data", "raw", "benefit_thresholds.xlsx")
+benefit_thresholds <- read_excel(benefit_thresholds_path)
+
+g <- plot_TFC_cost_assumptions(benefit_thresholds %>% filter(
+    name %in% c("PIP daily living standard", "PIP mobility standard",
+                "PIP daily living enhanced", "PIP mobility enhanced")
+))
+
+print(g)
+```
+
+
+```{r relate_other_costs_to_visits, cache = TRUE}
+# Generate random quantiles for patients
+set.seed(20220224)
+
+p_partner_will_stay_at_work <- 0.5
+n_households <- 28081  # thousands, from https://www.ons.gov.uk/peoplepopulationandcommunity/birthsdeathsandmarriages/families/datasets/familiesandhouseholdsfamiliesandhouseholds, Sheet 7.
+p_no_children <- (n_households - 5151 - 986 - 1775) / n_households  # proportion of households with no dependent children
+n_families <- 8154  # From sheet 3 of the above
+p_1_child <- 3465 / n_families * (1 - p_no_children)
+p_2_children <- 3450 / n_families * (1 - p_no_children)
+p_3_or_more_children <- 1239 / n_families * (1 - p_no_children)
+
+subjs <- unique(enroll_visit_train_data$subjid)
+n_subjs <- length(subjs)
+quantile_data <- data.frame(
+    subjid = subjs,
+    q_patient_benefit_uptake = runif(n_subjs),
+    q_socioeconomic = runif(n_subjs),  # Housing, income
+    partner_will_stay_at_work = rbinom(n_subjs, 1, p_partner_will_stay_at_work),
+    n_children = sample(0:3, n_subjs, prob = c(p_no_children, p_1_child, p_2_children, p_3_or_more_children),
+                        replace = TRUE)
+)
+
+enroll_visit_train_data %<>% estimate_HSC_costs_incurred(benefit_thresholds,
+                                                         quantile_data)
+
+costs_out <- assign_costs_to_cost_items(enroll_visit_train_data, cost_data,
+                                                        quantile_data)
+enroll_visit_train_data <- costs_out$visit_data
+cost_names <- costs_out$cost_names
+k <- costs_out$k
+```
+
+
+```{r save_enroll_train_data}
+destination_dir <- here("data", "processed")
+saveRDS(enroll_visit_train_data,
+        file.path(destination_dir, "enroll_train_with_costs.rds"))
+saveRDS(cost_names, file.path(destination_dir, "cost_names.rds"))
+write.csv(k, here("models", "salary_to_GDP_constant.csv"),
+          row.names = FALSE, col.names = FALSE)
+```
+
+

@@ -1,0 +1,309 @@
+---
+title: "Assess homoscedasticity of Enroll emissions"
+author: "Andrew Pollard"
+date: "28/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("here")
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("magrittr")
+library("readr")
+library("glue")
+library("caret")
+
+source(here("src_R", "utils.R"))
+
+```
+
+This document is for assessing the homo/heteroscedasticity
+(i.e. similarities/differences in covariance)
+of the emissions parameters over time,
+and hence between disease states.
+
+We understand and expect
+that the means of the emissions will change over time,
+as we expect HD to generally make things harder for patients.
+However, it is less clear what happens to the covariance matrix
+of the emissions variables
+as the disease progresses.
+
+We have seen that the `msm` package does not handle correlated emissions well,
+and that if the covariance matrices are significantly different between states,
+principal components analysis on the entire training data
+does not improve the fit.
+This may not be a problem if the emissions parameters are homoscedastic,
+i.e. the covariance matrices are sufficiently close to equal
+between different states.
+
+Therefore,
+we wish to assess the homoscedasticity of the emissions parameters.
+If they are close to homoscedastic,
+then it will likely be sufficient
+to proceed with PCA on the whole training set.
+If they are heteroscedastic to a non-negligible extent,
+then we will need to come up with another way
+of transforming the emissions to an uncorrelated set,
+or find another way to fit CTHMMs
+that allows for correlated emissions.
+
+
+## Read data
+
+```{r read_data, cache = TRUE}
+source_dir <- here("data", "processed")
+enroll_train <- read_csv(file.path(source_dir, "enroll_all_train.csv"))
+
+print(enroll_train, n = 20)
+```
+
+
+## Analyse covariance
+
+First we'll choose an appropriately sized time window.
+The plot below shows the smallest number of visits in a time window
+if the data is split into the number of time windows on the x-axis.
+
+```{r choose_time_window}
+plot_data <- tibble(n_time_windows = 4:10,
+                    min_n_visits = NA)
+
+age_range <- range(enroll_train$age)
+
+for (i_row in seq_along(plot_data$n_time_windows)) {
+    window_summaries <- enroll_train %>%
+        mutate(age_bracket = cut(age, plot_data$n_time_windows[i_row])) %>%
+        group_by(age_bracket) %>%
+        summarise(n_visits = n(), .groups = "drop_last")
+    
+    plot_data$min_n_visits[i_row] <- min(window_summaries$n_visits)
+}
+
+g <- ggplot(plot_data, aes(x = n_time_windows, y = min_n_visits)) +
+    geom_line() +
+    geom_point()
+
+print(g)
+
+n_visits_min <- 300
+n_time_windows_selected <- plot_data$n_time_windows[which(plot_data$min_n_visits <
+                                                              n_visits_min)[1] - 1]
+
+```
+
+We assert that we want at least `r n_visits_min` visits per time window
+in order to get a good estimate of the covariance.
+We want to maximise the number of time windows subject to this,
+so we get a good idea of how the covariance varies
+with disease progression.
+
+Based on the above plot,
+we'll use `r n_time_windows_selected` time windows,
+giving a width of `r (age_range[2] - age_range[1]) / n_time_windows_selected` years.
+
+```{r calculate_summary_stats}
+# Convert emissions variables into single vector-valued variable
+non_emission_vars <- c("subjid", "visdy", "age", "hdcat_0", "carelevl",
+                       "carehome", "occupatn", "maristat", "dssage")
+emission_vars <- setdiff(names(enroll_train), non_emission_vars)
+
+enroll_train %<>%
+    mutate(obs = as.matrix(enroll_train %>% select(!!emission_vars)),
+           age_bracket = cut(age, n_time_windows_selected))
+
+n_obs <- ncol(enroll_train$obs)
+
+# Calculate covariances
+preproc <- preProcess(enroll_train$obs, method = c("center", "scale"))
+plot_data <- (enroll_train %>%
+                  do_grouped_PCA("age_bracket", preproc))$pc_data
+
+```
+
+## Trend of means of emissions by age bracket
+
+```{r plot_means}
+means_plot <- ggplot(plot_data, aes(x = as.numeric(age_bracket), y = means,
+                                    colour = emission)) +
+    geom_line() +
+    geom_point() +
+    labs(x = "Age bracket",
+         title = paste0("Means of observed variables by age bracket \n",
+                        "(standardised to have mean 0 and sd 1 across whole data set)")) +
+    scale_x_continuous(breaks = seq_len(nlevels(plot_data$age_bracket)),
+                       labels = levels(plot_data$age_bracket))
+
+print(means_plot)
+```
+
+From the means plot,
+we can see that
+the variation in the means of the emissions variables over time
+is of a similar order of magnitude
+to the standard deviation of the emission variables.
+This means that if we calculate the principal components
+of the entire training data set,
+the correlation with time will be a driving factor.
+
+
+## Trend in covariance of emissions across age brackets
+
+This plot gives us an indication
+of whether taking principal components of the whole data set
+will give transformed variables
+that are independent within disease states,
+which is required for use in the `msm` package.
+
+We can see that there is noticeable variation
+in the covariance matrix across age brackets,
+so this warrants further inspection
+of how the principal components might vary by age.
+
+```{r plot_covs, fig.height = 10, fig.width = 16}
+for (i_obs in seq_len(n_obs)) {
+    plot_data %<>%
+        mutate(!!emission_vars[i_obs] := covariance[, i_obs])
+}
+
+plot_data %<>%
+    pivot_longer(!!emission_vars, names_to = "covar_Y", values_to = "covar")
+
+g <- ggplot(plot_data, aes(x = as.numeric(age_bracket), y = covar,
+                           colour = covar_Y)) +
+    geom_line() +
+    facet_wrap(vars(emission)) +
+    scale_x_continuous(breaks = seq_len(nlevels(plot_data$age_bracket)),
+                       labels = levels(plot_data$age_bracket))
+
+print(g)
+
+```
+
+
+## Variation of principal component loadings across age brackets
+
+```{r plot_PCs, fig.width = 12, fig.height = 8}
+loadings_plot <- plot_principal_component_variability(plot_data, "age_bracket",
+                                                      n_pcs_to_plot = 4)
+print(loadings_plot)
+
+```
+
+We can see from the above plots
+that the direction of the first principal component
+does not vary much by age.
+
+The second PC has a little more variation,
+while the 3rd PC has quite substantial variation.
+
+The first two principal components
+have an interesting interpretation.
+PC1 is driven by
+tfcscore, indepscl, sdmt1, sit1, motscore, fascore_trans,
+scnt1, swrt1 and sdmt1.
+These are mainly functional measures
+that are classically used to track HD stage.
+
+PC2 is driven by factors that have low correlation with the above:
+aptscore, exfscore and irascore.
+These are mainly mental health measures.
+
+PC3 and higher show such wild variation between age brackets
+that comparing the scores of these PCs between age brackets
+is going to be fairly meaningless.
+Therefore,
+we will keep only the first 2 principal components.
+
+```{r pc_scores, fig.height = 3}
+n_pcs_to_keep <- 2
+pc_scores_data <- (enroll_train %>%
+                       do_grouped_PCA("age_bracket", preproc,
+                                      n_pcs_to_keep = n_pcs_to_keep))$transformed_data
+
+alpha <- 0.05
+pc_scores_data %<>%
+    group_by(age_bracket) %>%
+    summarise(means = colMeans(obs_transformed_grouped),
+              lower = apply(obs_transformed_grouped, 2,
+                            function(x) quantile(x, alpha/2)),
+              upper = apply(obs_transformed_grouped, 2,
+                            function(x) quantile(x, 1 - alpha/2)),
+              .groups = "drop_last") %>%
+    mutate(PC = rep(paste0("PC", seq_len(n_pcs_to_keep)), nrow(.)/2))
+
+g <- ggplot(pc_scores_data, aes(x = as.numeric(age_bracket))) +
+    scale_x_continuous(breaks = seq_len(nlevels(pc_scores_data$age_bracket)),
+                       labels = levels(pc_scores_data$age_bracket)) +
+    geom_line(aes(y = means)) +
+    geom_point(aes(y = means)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+    facet_wrap(vars(PC)) +
+    labs(x = "Age bracket") +
+    theme(panel.spacing = unit(2, "lines"))
+
+print(g)
+```
+
+
+## Proportion of variance explained
+
+The plot below shows
+the cumulative proportion of variance explained
+by the principal components
+for the different age brackets.
+
+```{r plot_variance_explained}
+plot_data_pc_vars <- plot_data %>%
+    select(age_bracket, PC_vars, emission_num) %>%
+    rename(PC = emission_num) %>%
+    distinct() %>%
+    group_by(age_bracket) %>%
+    mutate(cumulative_prop_var_explained = cumsum(PC_vars / sum(PC_vars))) %>%
+    ungroup()
+
+g <- ggplot(plot_data_pc_vars, aes(x = as.numeric(age_bracket),
+                                   y = cumulative_prop_var_explained,
+                                   colour = PC)) +
+    geom_line() +
+    scale_x_continuous(breaks = seq_len(nlevels(plot_data_pc_vars$age_bracket)),
+                       labels = levels(plot_data_pc_vars$age_bracket))
+
+print(g)
+```
+
+The above plot shows that
+while there is some variation in
+the proportion of variance explained
+by the principal components,
+it is not a large variation,
+and the first PC consistently explains
+around 60% of the variance,
+while the first 2 PCs explain 70-75% of the variance.
+While we would normally want to keep more PCs,
+as explained above,
+the higher PCs vary too much between age brackets
+to be reliable.
+
+This, coupled with the above observation
+that the first PC hardly varies at all over time,
+gives us some confidence that
+we can obtain better results by taking PCs
+than using the raw emissions.
+
+However, based on the above observation that
+the significant trend in the means over time
+will significantly affect the principal components
+of the entire training data set,
+we should take the principal components in smaller time windows instead.
+
+The analysis on heteroscedastic synthetic data
+(see analysis/3_msm_assessment/5_assess_msm_with_challenging_synthetic_data_set)
+shows that taking principal components in smaller time windows
+does indeed give good results,
+and taking principal components of the whole data set may not work well
+if the data is heteroscedastic.

@@ -1,0 +1,42 @@
+---
+title: "Dirichlet cost sampling"
+author: "Andrew Pollard"
+date: '2022-05-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r generate_samples}
+target_means <- c(1.5, 3, 6, 9)
+n_costs <- length(target_means)
+beta <- 3.6
+alpha <- beta * sum(target_means)
+n_samples <- 1e4
+
+set.seed(20220519)
+total_costs <- rgamma(n_samples, alpha, beta)
+
+alpha_indiv <- beta * target_means
+
+gammas <- matrix(0, nrow = n_costs, ncol = n_samples)
+
+for (i_cost in seq_len(n_costs)) {
+    gammas[i_cost, ] <- rgamma(n_samples, alpha_indiv[i_cost], beta)
+}
+
+dirichlets <- gammas / matrix(colSums(gammas),
+                              nrow = n_costs,
+                              ncol = n_samples,
+                              byrow = TRUE)
+
+indiv_costs <- dirichlets * matrix(total_costs,
+                                   nrow = n_costs,
+                                   ncol = n_samples,
+                                   byrow = TRUE)
+
+rowMeans(indiv_costs)
+all.equal(colSums(indiv_costs), total_costs)
+```

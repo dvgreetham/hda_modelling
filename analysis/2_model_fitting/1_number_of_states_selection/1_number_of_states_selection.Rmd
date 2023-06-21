@@ -1,0 +1,560 @@
+---
+title: "Number of states selection"
+author: "Andrew Pollard"
+date: "26/08/2021"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("here")
+library("dplyr")
+library("readr")
+library("foreach")
+library("doParallel")
+library("glue")
+library("caret")
+library("msm")
+
+source(here("src_R", "utils.R"))
+source(here("src_R", "model.R"))
+```
+
+This is a document for selecting
+the best number of hidden states
+for the continuous-time hidden Markov model (CTHMM)
+using cross-validation.
+
+```{r read_train_data, include = FALSE}
+enroll_visit_train_path <- here("data", "processed", "enroll_all_train.csv")
+enroll_visit_train_data <- read_csv(enroll_visit_train_path)
+```
+
+Starting with `r n_distinct(enroll_visit_train_data$subjid)` patients.
+
+Optionally, here we filter on
+a minimum number of visits per patient
+(a minimum of 1 effectively turns off this filtering)
+and a minimum number of years that the patients' visits must span
+(a minimum of zero can be specified to turn off this filtering).
+
+```{r filter_on_number_of_visits}
+n_visits_min <- 1
+subjs_to_keep <- enroll_visit_train_data %>%
+    group_by(subjid) %>%
+    summarise(n_visits = n(), .groups = "drop_last") %>%
+    filter(n_visits >= n_visits_min) %>%
+    pull(subjid)
+
+enroll_visit_train_data %<>%
+    filter(subjid %in% subjs_to_keep)
+
+```
+
+`r n_distinct(enroll_visit_train_data$subjid)` patients remaining
+after asserting at least `r n_visits_min` visit(s).
+
+```{r filter_on_visit_range}
+n_years_min <- 0
+days_per_year_avg <- 365.25
+
+subjs_to_keep <- enroll_visit_train_data %>%
+    group_by(subjid) %>%
+    summarise(visit_range = (max(visdy) - min(visdy)) / days_per_year_avg,
+              .groups = "drop_last") %>%
+    filter(visit_range >= n_years_min) %>%
+    pull(subjid)
+
+enroll_visit_train_data %<>%
+    filter(subjid %in% subjs_to_keep)
+```
+
+`r n_distinct(enroll_visit_train_data$subjid)` patients remaining
+after asserting visits must span at least `r n_years_min` years.
+
+
+```{r set_parameters}
+non_emission_vars <- c("subjid", "visdy", "age", "hdcat_0", "carelevl",
+                       "carehome", "occupatn", "maristat", "dssage")
+
+n_states_vec <- 3:6
+n_hidden_states_vec <- n_states_vec - 1  # Last state is death, which is not hidden
+
+# Combine emissions into single vector-valued observation
+emission_vars <- setdiff(names(enroll_visit_train_data), non_emission_vars)
+
+enroll_visit_train_data$obs <- as.matrix(enroll_visit_train_data %>%
+                                             select(!!emission_vars))
+
+n_pcs_to_keep <- 2
+k_folds_xval <- 5
+forward_chain_order <- 1
+
+```
+
+```{r train_validate_split}
+subjs <- unique(enroll_visit_train_data$subjid)
+set.seed(20210831)
+in_val <- createFolds(seq_along(subjs), k = k_folds_xval)
+
+enroll_train <- list()
+enroll_validate <- list()
+
+
+for (i_fold in seq_len(k_folds_xval)) {
+    subjs_train <- subjs[-in_val[[i_fold]]]
+    subjs_validate <- subjs[in_val[[i_fold]]]
+    
+    enroll_train[[i_fold]] <- enroll_visit_train_data %>%
+        filter(subjid %in% subjs_train)
+    
+    enroll_validate[[i_fold]] <- enroll_visit_train_data %>%
+        filter(subjid %in% subjs_validate)
+}
+```
+
+```{r grouped_PCA, cache = TRUE}
+cl <- makeCluster(min(k_folds_xval, detectCores()))
+registerDoParallel(cl)
+
+preproc <- foreach(i_fold = seq_len(k_folds_xval),
+                   .packages = "caret") %dopar% {
+                       preProcess(enroll_train[[i_fold]]$obs,
+                                  method = c("center", "scale"))
+                   }
+
+pca_out <- foreach(i_fold = seq_len(k_folds_xval),
+                   .packages = c("glue", "dplyr", "magrittr", "tidyr")) %dopar% {
+                       do_grouped_PCA_list(enroll_train[[i_fold]], preproc[[i_fold]],
+                                           n_states_vec,
+                                           n_pcs_to_keep)
+                   }
+
+stopCluster(cl)
+
+pc_data <- list()
+transformed_data <- list()
+for (i_fold in seq_len(k_folds_xval)) {
+    pc_data[[i_fold]] <- pca_out[[i_fold]]$pc_data
+    transformed_data[[i_fold]] <- pca_out[[i_fold]]$transformed_data
+}
+
+```
+
+We add an extra observation for each patient at age 0,
+at which point we assume
+we directly observe state 1.
+This tells the model that
+all patients show no adverse effects from the disease at birth
+-- state 1 is the healthiest state.
+The `msm` package does not correctly handle the data
+if this observation is not added.
+We have been in contact with the package author,
+and he added the ability to have both hidden states
+and directly observed states in the same model.
+
+```{r set_up_msm_inputs}
+transformed_data_extra_obs <- list()
+init_emis_params <- list()
+hmodel <- list()
+Q_init <- list()
+label_death <- -999
+age_death_max <- 81  # Approx UK life expectancy
+
+for (i_fold in seq_len(k_folds_xval)) {
+    # Add death observations
+    transformed_data_extra_obs[[i_fold]] <- lapply(
+        seq_along(n_states_vec),
+        function(i_model) add_death_observations(
+            transformed_data[[i_fold]][[i_model]],
+            label_death,
+            idx_deathstate = n_states_vec[i_model],
+            age_death_max = age_death_max,
+            obs_var = "obs_transformed_grouped"
+        )
+    )
+    
+    # Add extra observation corresponding to age 0
+    transformed_data_extra_obs[[i_fold]] <- lapply(
+        transformed_data_extra_obs[[i_fold]],
+        function(x) add_observations_of_state_1_at_age_0(x, "obs_transformed_grouped")
+    )
+    
+
+    
+    # Set initial emission parameters
+    init_emis_params[[i_fold]] <- lapply(
+        seq_along(n_states_vec),
+        function(i_model) {
+            calculate_initial_parameter_values_for_msm(
+                transformed_data_extra_obs[[i_fold]][[i_model]],
+                n_states_vec[i_model],
+                label_death,
+                obs_var = "obs_transformed_grouped"
+            )
+        }
+    )
+    
+    # Set initial hmodel parameters
+    hmodel[[i_fold]] <- list()
+    for (i_model in seq_along(n_states_vec)) {
+        hmodel[[i_fold]][[i_model]] <- set_up_hmm_model(
+            init_emis_params[[i_fold]][[i_model]],
+            obs_to_select = seq_len(n_pcs_to_keep),
+            label_death = label_death
+        )
+    }
+    
+    # Set initial transition intensity matrices
+    Q_init[[i_fold]] <- lapply(
+        seq_along(n_states_vec),
+        function(i_params) {
+            create_FC_intensity_matrix_from_sojourn_times(
+                init_emis_params[[i_fold]][[i_params]]$sojourn_times,
+                order = forward_chain_order
+            )
+        }
+    )
+}
+
+```
+
+```{r msm_fits, cache = TRUE}
+cl <- makeCluster(min(length(n_states_vec) * k_folds_xval, detectCores()))
+registerDoParallel(cl)
+
+# Need to create several sets of PCs based on the number of assumed states.
+msm_fits <- foreach(i_fold = seq_len(k_folds_xval), .packages = "msm") %:%
+    foreach(i_params = seq_along(n_states_vec),
+            .packages = "msm") %dopar%
+    {
+        .GlobalEnv$my_data <- transformed_data_extra_obs[[i_fold]][[i_params]]
+        msm(obs_transformed_grouped ~ age, subject = subjid, data = my_data,
+            qmatrix = Q_init[[i_fold]][[i_params]],
+            hmodel = hmodel[[i_fold]][[i_params]],
+            obstrue = my_data$obstrue,
+            obstype = my_data$obstype,
+            est.initprobs = FALSE,
+            method = "BFGS",
+            control = list(maxit = 500, fnscale = 5e4))
+    }
+
+stopCluster(cl)
+```
+
+
+## Plot training likelihood
+
+Here we plot the likelihood of each model
+evaluated on the training set.
+Significant differences between this
+and the validation likelihood in the next section
+could indicate overfitting.
+In this case, they look similar.
+
+```{r calculate_training_llhd, cache = TRUE}
+plot_data_list <- list()
+for (i_fold in seq_len(k_folds_xval)) {
+    plot_data_list[[i_fold]] <- calculate_training_log_likelihood(msm_fits[[i_fold]],
+                                                                  n_states_vec)
+    plot_data_list[[i_fold]]$fold <- as.character(i_fold)
+}
+
+plot_data <- bind_rows(plot_data_list)
+
+```
+
+```{r plot_training_llhd}
+g <- ggplot(plot_data, aes(x = n_states, y = training_llhd, colour = fold)) +
+    geom_point() +
+    geom_line()
+print(g)
+
+plot_data %<>%
+    group_by(n_states) %>%
+    summarise(mean_training_llhd = mean(training_llhd),
+              .groups = "drop_last")
+
+g <- ggplot(plot_data, aes(x = n_states, y = mean_training_llhd)) +
+    geom_point() +
+    geom_line()
+print(g)
+
+```
+
+
+## Plot likelihood on validation set
+
+For each fold,
+we train the model on the training set
+and calculate the likelihood on the validation set.
+This gives a method for selecting a number of states
+which is robust to overfitting,
+and is similar to the method used by
+Sun et al. (see Reference 48 on the project drive).
+
+```{r calculate_transformed_validation_data, cache = TRUE}
+
+transformed_val_data_extra_obs <- list()
+
+for (i_fold in seq_len(k_folds_xval)) {
+    transformed_val_data <- transform_raw_observations_to_grouped_PCs(
+        enroll_validate[[i_fold]], pc_data[[i_fold]], preproc[[i_fold]],
+        n_states_vec, n_pcs_to_keep
+    )
+    
+    # Add death observations
+    transformed_val_data_extra_obs[[i_fold]] <- lapply(
+        seq_along(n_states_vec),
+        function(i_model) add_death_observations(
+            transformed_val_data[[i_model]],
+            label_death,
+            idx_deathstate = n_states_vec[i_model],
+            age_death_max = age_death_max,
+            obs_var = "obs_transformed_grouped"
+        )
+    )
+    
+    # Add extra observation corresponding to age 0
+    transformed_val_data_extra_obs[[i_fold]] <- lapply(
+        transformed_val_data_extra_obs[[i_fold]],
+        function(x) add_observations_of_state_1_at_age_0(x, "obs_transformed_grouped")
+    )
+}
+
+```
+
+```{r calc_loglik_validation_set, cache = TRUE}
+
+for (i_fold in seq_len(k_folds_xval)) {
+    plot_data_list[[i_fold]] <- calculate_test_log_likelihood(
+        msm_fits[[i_fold]], transformed_val_data_extra_obs[[i_fold]],
+        n_states_vec, plot_data_list[[i_fold]],
+        obs_var = "obs_transformed_grouped",
+        label_death = label_death
+    )
+}
+
+plot_data <- bind_rows(plot_data_list)
+
+```
+
+```{r plot_loglik_validation_set}
+g <- ggplot(plot_data, aes(x = n_states, y = test_llhd, colour = fold)) +
+    geom_point() +
+    geom_line()
+print(g)
+
+plot_data %<>%
+    group_by(n_states) %>%
+    summarise(mean_test_llhd = mean(test_llhd),
+              .groups = "drop_last")
+
+g <- ggplot(plot_data, aes(x = n_states, y = mean_test_llhd)) +
+    geom_point() +
+    geom_line() +
+    labs(x = "Number of states",
+         y = "Mean log-likelihood on validation sets")
+print(g)
+```
+
+
+## Check AIC and BIC
+
+Here we examine the AIC and BIC
+on the training set.
+
+```{r calculate_AIC_BIC_training, cache = TRUE}
+plot_data_AIC_BIC_list <- list()
+for (i_fold in seq_len(k_folds_xval)) {
+    n_obs <- nrow(transformed_data_extra_obs[[i_fold]][[1]])
+    plot_data_AIC_BIC_list[[i_fold]] <- calculate_AIC_BIC(plot_data_list[[i_fold]],
+                                                          msm_fits[[i_fold]], n_obs)
+    
+    plot_data_AIC_BIC_list[[i_fold]]$fold <- as.character(i_fold)
+    
+    print(plot_data_AIC_BIC_list[[i_fold]] %>% pivot_wider(names_from = type,
+                                                           values_from = criterion))
+}
+
+plot_data_AIC_BIC <- bind_rows(plot_data_AIC_BIC_list)
+
+```
+
+```{r plot_AIC_BIC_training}
+
+g <- ggplot(plot_data_AIC_BIC, aes(x = n_states, y = criterion, colour = type)) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(vars(fold))
+print(g)
+
+```
+
+
+## Convergence
+
+(0 indicates successful convergence)
+
+```{r convergence, cache = TRUE}
+for (i_fold in seq_len(k_folds_xval)) {
+    print(paste0("Fold ", i_fold))
+    for (msm_fit in msm_fits[[i_fold]]) {
+        print(msm_fit$opt$convergence)
+    }
+}
+```
+
+
+## Examine sojourn times
+
+These are supposed to be
+the expected time spent in each state,
+but they don't seen to be consistent
+with our knowledge of the disease.
+We plan to investigate this further.
+
+```{r sojourn_times, cache = TRUE}
+for (i_fold in seq_len(k_folds_xval)) {
+    print(paste0("Fold ", i_fold))
+    for (msm_fit in msm_fits[[i_fold]]) {
+        print(sojourn.msm(msm_fit))
+    }
+}
+```
+
+
+## Details of fits
+
+The plots below show
+the fitted emission distributions
+of the CTHMMs.
+The fitted means are plotted with
+a band corresponding to twice the fitted standard deviation
+(this is roughly equivalent to a 95% confidence interval
+with a normal distribution assumption).
+
+The columns correspond to the different emissions
+(i.e. principal components),
+and the rows correspond to the number of states fitted.
+
+```{r details_of_fits, cache = TRUE}
+plot_data <- data.frame()
+for (i_fold in seq_len(k_folds_xval)) {
+    for (i_model in seq_along(msm_fits[[i_fold]])) {
+        params <- msm_fits[[i_fold]][[i_model]]$hmodel$pars
+        n_hidden_states <- n_hidden_states_vec[i_model]
+        
+        # For each hidden state and each observation (i.e. principal component),
+        # we have a mean and a standard deviation.
+        n_emission_params <- 2 * n_hidden_states * n_pcs_to_keep
+        emission_means <- params[seq(1, n_emission_params, by = 2)]
+        emission_sds <- params[seq(2, n_emission_params, by = 2)]
+        idx_emission <- rep(seq_len(n_pcs_to_keep), n_hidden_states)
+        idx_state <- rep(seq_len(n_hidden_states), each = n_pcs_to_keep)
+        plot_data %<>% bind_rows(data.frame(
+            idx_emission = idx_emission,
+            e_mean = emission_means,
+            e_sd = emission_sds,
+            fold = as.character(i_fold),
+            n_hidden_states = n_hidden_states,
+            idx_state = idx_state
+        ))
+    }
+}
+
+```
+
+```{r plot_details_of_fits, fig.width = 10, fig.height = 20}
+
+g <- ggplot(plot_data, aes(x = idx_state)) +
+    geom_point(aes(y = e_mean, colour = fold)) +
+    geom_line(aes(y = e_mean, colour = fold)) +
+    geom_ribbon(aes(ymin = e_mean - 2*e_sd, ymax = e_mean + 2*e_sd, fill = fold),
+                alpha = 0.2) +
+    facet_grid(rows = vars(n_hidden_states), cols = vars(idx_emission),
+               labeller = label_both)
+
+print(g)
+```
+
+
+Observations on the above plots:
+
+* For numbers of states $\leqslant 5$,
+  the fitted means and standard deviations of the emissions
+  for the different states
+  show strong consistency between folds,
+  with the exception of a sign flip for one of the folds.
+  Differences in sign are to be expected,
+  as the the direction of the principal components
+  can always be reversed to give an equally valid solution.
+* For numbers of states > 5,
+  there is some inconsistency in the fitted emission parameters.
+* For 8 states, the fitted variance is very large,
+  and the sojourn times for the states are all equal,
+  suggesting that the fit has become degenerate somehow
+  -- this may be due to no low-variance solutions
+  existing for this number of states,
+  so the algorithm converges to a local optimum
+  with high variances.
+* For numbers of states $\leqslant 4$,
+  the fitted means for the second principal component
+  are almost identical for all states,
+  with just a gradual increase in variance
+  distinguishing the states.
+* For $n_\text{states} = 5$,
+  the most noticeable change in PC2
+  when progressing through the states
+  is the change between states 3 and 4.
+  There is a difference in the mean,
+  and the standard deviation for state 4
+  is much smaller than that of state 3.
+  It seems that there is only
+  one point where PC2 changes significantly,
+  and it's between states 3 and 4,
+  at which point PC1 stays largely the same.
+  This behaviour would represent an improvement
+  in some symptoms --
+  this may be genuine,
+  or may be evidence that states 3 and 4 are "parallel states"
+  rather than sequential states.
+  This needs further investigation.
+* When I re-ran this keeping only PC1,
+  the solutions for all numbers of states
+  had high variances for PC1,
+  and they were all degenerate
+  in the sense that the fitted sojourn times
+  were all equal.
+* This shows that keeping only 1 PC
+  only produces degenerate solutions,
+  and there's no clear number of states to choose,
+  while if we keep 2 PCs,
+  we can argue that 5 states is best,
+  because it has higher test likelihood
+  (and better AIC & BIC) than lower numbers of states,
+  and for higher numbers of states
+  the solution is either not consistent between folds,
+  indicating poor robustness
+  and consistency of the solution between data sets,
+  or we have the problem described above
+  in which all variances are high.
+
+## Ten-year transition probabilities
+
+```{r P_matrices}
+i_model <- which(n_states_vec == 5)
+g <- plot_state_transition_matrix(msm_fits, k_folds_xval, i_model,
+                                  n_years = 10)
+
+print(g)
+```
+
+
+
+## Conclusions
+
+Based on the above observations,
+we conclude that we should fit a CTHMM with 5 states,
+and keep the first 2 principal components.

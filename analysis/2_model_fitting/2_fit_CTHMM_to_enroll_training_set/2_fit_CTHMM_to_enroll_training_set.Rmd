@@ -1,0 +1,841 @@
+---
+title: "Fit CTHMM to Enroll training set"
+author: "Andrew Pollard"
+date: "27/10/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("here")
+library("dplyr")
+library("readr")
+library("foreach")
+library("doParallel")
+library("caret")
+library("glue")
+library("msm")
+
+source(here("src_R", "utils.R"))
+source(here("src_R", "model.R"))
+```
+
+This document fits the continuous-time hidden Markov model (CTHMM)
+to the Enroll training set
+using the number of states and number of principal components
+that has been selected in previous analysis.
+
+```{r read_train_data, include = FALSE}
+enroll_train_path <- here("data", "processed", "enroll_all_train.csv")
+enroll_train <- read_csv(enroll_train_path)
+```
+
+```{r set_parameters}
+non_emission_vars <- c("subjid", "visdy", "age", "hdcat_0", "carelevl",
+                       "carehome", "occupatn", "maristat", "dssage")
+
+emission_vars_dict <- c(
+    "aptscore" = "Apathy",
+    "exfscore_trans" = "Executive function",
+    "fascore_trans" = "Functional assessment",
+    "indepscl" = "Independence",
+    "irascore_trans" = "Irritability/agression",
+    "motscore" = "Motor",
+    "scnt1" = "Stroop colour naming",
+    "sdmt1" = "Symbol digit modality",
+    "sit1" = "Stroop interference",
+    "swrt1" = "Stroop word reading",
+    "tfcscore" = "Total Functional Capacity",
+    "verfct5" = "Categorical verbal fluency"
+)
+
+n_states <- 5
+n_hidden_states <- n_states - 1  # Last state is death, so not hidden
+n_pcs_to_keep <- 2
+label_death <- -999
+
+death_ages_and_last_visits <- get_death_ages_and_last_visits(enroll_train)
+
+T_i_all <- death_ages_and_last_visits$T_i
+T_j_all <- death_ages_and_last_visits$T_j
+
+target_life_expectancy <- get_hd_life_expectancy()
+
+age_death_max <- calculate_artificial_max_death_age(
+    target_life_expectancy, T_i_all, T_j_all
+)
+
+# Combine emissions into single vector-valued observation
+emission_vars <- setdiff(names(enroll_train), non_emission_vars)
+
+enroll_train$obs <- as.matrix(enroll_train %>%
+                                  select(!!emission_vars))
+
+```
+
+```{r grouped_PCA, cache = TRUE}
+enroll_train %<>%
+    mutate(age_bracket = cut(age, n_states))
+
+preproc <- preProcess(enroll_train$obs, method = c("center", "scale"))
+
+grouping_var = "age_bracket"
+pca_results <- do_grouped_PCA(enroll_train, grouping_var, preproc,
+                              n_pcs_to_keep = n_pcs_to_keep)
+
+out <- make_PCA_signs_more_consistent(pca_results$pc_data,
+                                      pca_results$transformed_data,
+                                      n_pcs_to_keep,
+                                      grouping_var)
+
+```
+
+```{r set_up_msm_inputs}
+
+# Add death observations
+transformed_data_extra_obs <- add_death_observations(
+    out$obs_data,
+    label_death,
+    idx_deathstate = n_states,
+    age_death_max = age_death_max,
+    obs_var = "obs_transformed_grouped"
+)
+
+# Add extra observations corresponding to age 0
+transformed_data_extra_obs <- add_observations_of_state_1_at_age_0(
+    transformed_data_extra_obs,
+    "obs_transformed_grouped"
+)
+
+# Set initial emission parameters
+init_emis_params <- calculate_initial_parameter_values_for_msm(
+    transformed_data_extra_obs,
+    n_states,
+    label_death,
+    obs_var = "obs_transformed_grouped"
+)
+
+# Set initial hmodel parameters
+hmodel <- set_up_hmm_model(init_emis_params,
+                           obs_to_select = seq_len(n_pcs_to_keep),
+                           label_death = label_death)
+
+# Set initial transition intensity matrix
+Q_init <- create_FC_intensity_matrix_from_sojourn_times(
+    init_emis_params$sojourn_times,
+    order = 1
+)
+
+```
+
+```{r msm_fit, cache = TRUE}
+
+msm_fit <- msm(obs_transformed_grouped ~ age, subject = subjid,
+               data = transformed_data_extra_obs,
+               qmatrix = Q_init,
+               hmodel = hmodel,
+               obstrue = obstrue,
+               obstype = obstype,
+               est.initprobs = FALSE,
+               method = "BFGS",
+               control = list(maxit = 500, fnscale = 5e4))
+
+```
+
+Model convergence was `r ifelse(msm_fit$opt$convergence == 0, "successful", "unsuccessful")`.
+
+
+## Examine sojourn times
+
+```{r examine_sojourn_times}
+print(sojourn.msm(msm_fit))
+```
+```{r plot_sojourn_times, fig.height = 2}
+# Old sojourn times from git commit eac58b3
+plot_data <- sojourn.msm(msm_fit) %>%
+    rownames_to_column("state") %>%
+    mutate(results = "With correction") %>%
+    bind_rows(tibble(state = paste0("State ", 1:4),
+                     estimates = c(24.89912, 20.52190, 16.50923, 29.99745),
+                     results = "Without correction"))
+              
+g <- ggplot(plot_data, aes(x = results, y = estimates, fill = state)) +
+    geom_col(position = position_stack(reverse = TRUE)) +
+    labs(x = "Results", y = "Expected age") +
+    scale_y_continuous(breaks = seq(0, 90, by = 10)) +
+    coord_flip()
+
+print(g)
+```
+
+
+## 10-year transition probabilities 
+
+```{r state_transition_matrix}
+Q_est <- qmatrix.msm(msm_fit)$estimate
+
+Q_est
+
+g <- plot_state_transition_matrix(msm_fit, n_years = 10)
+print(g)
+```
+
+
+## Examine fitted emission distributions
+
+```{r details_of_fits, fig.width = 12}
+
+emission_means <- msm_fit$hmodel$pars[seq(1, length(msm_fit$hmodel$pars) - 1,
+                                          by = 2)]
+emission_sds <- msm_fit$hmodel$pars[seq(2, length(msm_fit$hmodel$pars) - 1,
+                                        by = 2)]
+idx_emission <- rep(seq_len(n_pcs_to_keep), n_hidden_states)
+idx_state <- rep(seq_len(n_hidden_states), each = n_pcs_to_keep)
+
+sig <- 0.05  # Significance level for showing uncertainty range
+n_sigma <- qnorm(sig/2, lower.tail = FALSE)
+plot_data <- data.frame(
+    Principal_Component = idx_emission,
+    e_mean = emission_means,
+    e_sd = emission_sds,
+    idx_state = idx_state
+)
+
+
+
+g <- ggplot(plot_data, aes(x = idx_state)) +
+    geom_ribbon(aes(ymin = e_mean - n_sigma*e_sd,
+                    ymax = e_mean + n_sigma*e_sd,
+                    fill = "Middle 95% of fitted distribution"),
+                alpha = 0.8) +
+    geom_point(aes(y = e_mean, colour = "Fitted mean")) +
+    geom_line(aes(y = e_mean, colour = "Fitted mean")) +
+    facet_grid(cols = vars(Principal_Component),
+               labeller = label_both) +
+    scale_fill_manual("", values = "grey") +
+    scale_colour_manual("", values = "blue") +
+    labs(x = "Disease state",
+         y = "value") +
+    theme()
+
+print(g)
+```
+
+
+## Examine correlations between emissions within fitted states
+
+In the plot below,
+we examine the principal component scores
+for each visit in the data.
+The Viterbi algorithm has been used
+to calculate the most likely state sequence for each patient,
+and these fitted states have been used to colour the points.
+
+```{r most_likely_state_sequences}
+vit <- viterbi.msm(msm_fit) %>%
+    mutate(fitted_state = as.factor(fitted)) %>%
+    filter(fitted < n_states) %>%
+    filter(time > 0)
+
+g <- ggplot(vit, aes(x = observed.pc_1, y = observed.pc_2)) +
+    geom_point(aes(colour = fitted_state), alpha = 0.2)
+
+print(g)
+```
+
+Notes on the above plot:
+
+* The main progression of the disease is left-to-right,
+  with increasing PC1.
+
+In the table below,
+we look at the correlations between the transformed emissions
+(i.e. the principal components)
+for each fitted state.
+Ideally, these should be zero.
+If they are large,
+we would need to recalculate the principal components,
+this time grouped by fitted state,
+and reiterate the CTHMM fit.
+
+```{r correlations}
+vit %>%
+    group_by(fitted_state) %>%
+    summarise(cor(observed.pc_1, observed.pc_2),
+              .groups = "drop_last")
+```
+
+We can see in this case that
+the correlations between the principal components
+are not very high,
+so there is no need use an iterative approach
+to fit the model.
+
+
+## Examine distributions of raw emissions within fitted states
+
+In this section,
+we use the patients' fitted state sequences
+along with their raw emissions data
+to plot the distribution of the raw emissions
+for each fitted state.
+
+```{r raw_emission_distns}
+
+enroll_train_with_fit <- enroll_train %>%
+    left_join(vit, by = c("subjid" = "subject", "age" = "time"))
+
+extra_rows <- tibble(subjid = unique(enroll_train_with_fit$subjid),
+                     age = 0, fitted = 1)
+
+enroll_train_with_fit %<>%
+    bind_rows(extra_rows) %>%
+    arrange(subjid, age) %>%
+    mutate(fitted_state = as.factor(fitted))
+
+sig = 0.05
+
+plot_data <- enroll_train_with_fit %>%
+    pivot_longer(all_of(emission_vars), names_to = "variable") %>%
+    mutate(emission_name = emission_vars_dict[variable]) %>%
+    group_by(fitted, emission_name) %>%
+    summarise(means = mean(value, na.rm = TRUE),
+              lower = quantile(value, sig/2, na.rm = TRUE),
+              upper = quantile(value, 1 - sig/2, na.rm = TRUE),
+              .groups = "drop")
+
+emissions_plot <- ggplot(plot_data, aes(x = fitted)) +
+    geom_line(aes(y = means)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper),
+                alpha = 0.2) +
+    facet_wrap(vars(emission_name), scales = "free_y")
+
+print(emissions_plot)
+```
+
+Notes on the above plot:
+
+* The plot shows the means as a solid black line,
+  and the 2.5th and 97.5th percentiles as the grey band.
+* It appears that some variables such as the Stroop tests
+  (interference, word reading, colour naming)
+  show clearer decline between states 1 and 2 than TFC.
+  This shows that TFC alone
+  is not sufficient for measuring disease progression
+  in the early states of the disease.
+* The variables "Motor", "Functional assessment" and "Total Functional Capacity"
+  all share the feature that
+  they stay quite close to healthy values for the state 1-2 transition,
+  but then suddenly deteriorate at the state 2-3 transition.
+  Therefore, the transition that best corresponds to
+  the point of "motor onset" is state 2-3.
+
+
+## Distributions of costs
+
+We wish to infer $f_{X|S}(x| s)$,
+where:
+
+* $X$ is total cost per month
+* $S$ is the disease state
+* $f_{X|S}$ is the conditional PDF of the cost per month given the state.
+
+We have the fitted distribution of disease states
+and an estimated cost for each patient visit,
+which gives us $\mathbb{P}(S=s\mid X=x)$.
+
+Ideally, we would like to use Bayes' Theorem to calculate:
+
+$$
+f_{X|S}(x|s) = \frac{\mathbb{P}(S=s\mid X=x) f_X(x)}{\mathbb{P}(S=s)}
+$$
+
+where $f_X(x)$ is the marginal PDF of the total cost per month $X$.
+
+However, we don't have $\mathbb{P}(S=s\mid X=x)$ for every value of $x$,
+so it's not immediately obvious how to calculate
+$f_{X|S}(x|s)$ for every $x$.
+We would need to fit a curve for the density of $X|s$ for each $s$,
+and for that we need to assume a distributional form for $X|s$.
+
+This problem does not quite fit a standard Bayesian approach,
+because:
+
+* we don't have an explicit form for the likelihood
+  $\mathbb{P}(S=s\mid X=x)$ of the state
+* we do not have direct observations of the state $S$;
+  we "observe" the probabilities of each $s$ via the CTHMM fit.
+* The data points are not independent --
+  two visits of the same patient will have correlation in cost
+
+Therefore, we propose an alternative approach,
+in which we assume a distributional form for costs as follows:
+
+$$
+X \mid s \sim \text{Gamma}(\alpha_s, \lambda_s)
+$$
+
+The Gamma distribution is chosen because
+it is strictly positive,
+sufficiently flexible to model a variety of distribution shapes
+(unlike the exponential distribution for example),
+and has useful mathematical properties such as
+the sum of independent Gammas being another Gamma,
+and a relatively simple PDF
+to make some analytic work tractable.
+
+We can now write the conditional PDF of $X|S$
+in the parametric form:
+
+$$
+f_{X|S}(x_i; \alpha_s, \lambda_s)
+$$
+
+We will denote by $p_{i,s} = \mathbb{P}(S = s \mid X = x_i)$
+the state probabilities from the CTHMM fit,
+taken as conditional probabilities given the "observed" cost $x_i$.
+(In practice, we take $X = 1 + \text{cost}$ to avoid zero likelihoods).
+
+We will treat an "observation" of "cost $x_i$ at state $s$ with probability $p_{i,s}$"
+as a "diluted" full observation of cost $x_i$ at state $s$;
+i.e. the contribution to the likelihood is taken to be
+
+$$
+f_{X|S}(x_i; \alpha_s, \lambda_s)^{p_{i,s}}
+$$
+The overall likelihood is therefore
+
+$$
+L(\alpha,\lambda;\mathbf{x}, P) = \prod_{i=1}^n \left[
+\prod_{s=1}^{n_s} \left(\frac{x_i^{\alpha_s-1}\lambda_s^{\alpha_s}e^{-\lambda_s x_i}}{\Gamma(\alpha_s)}\right)^{p_{i,s}}
+\right]
+$$
+
+where:
+
+* $n$ is the number of observations (visits)
+* $n_s$ is the number of states in the model
+* $\alpha = (\alpha_1, \dots, \alpha_{n_s})$
+  is the vector of shape parameters
+* $\lambda = (\lambda_1, \dots, \lambda_{n_s})$
+  is the vector of rate parameters
+* $\mathbf{x} = (x_1, \dots, x_n)$ is the vector of observed total costs
+* $P = (p_{i,s})_{\substack{i=1,\dots,n \\ s=1,\dots,n_s}}$
+  is the matrix of all values of $p_{i,s} = \mathbb{P}(S = s \mid X = x_i)$.
+
+The log-likelihood is then
+
+$$
+\ell(\alpha, \lambda; x, P) = \sum_{i=1}^n \sum_{s=1}^{n_s} p_{i,s} \big[
+  (\alpha_s - 1)\log x_i + \alpha_s\log\lambda_s - \lambda_s x_i
+ - \log\Gamma(\alpha_s)
+\big]
+$$
+
+When taking the partial derivative w.r.t. $\lambda_s$,
+this log-likelihood separates,
+allowing us to find the MLE $\hat{\lambda}_s$
+in terms of the MLE $\hat{\alpha}_s$:
+
+\begin{eqnarray}
+\frac{\partial\ell}{\partial\lambda_s} &=&
+  \sum_{i=1}^n p_{i,s}\left(\frac{\alpha_s}{\lambda_s} - x_i\right) \\
+  &=& \frac{\alpha_s}{\lambda_s}\sum_{i=1}^n p_{i,s} - \sum_{i=1}^n p_{i,s}x_i
+\end{eqnarray}
+
+$$
+\hat{\lambda}_s = \frac{\hat{\alpha}_s\sum\limits_{i=1}^n p_{i,s}}
+{\sum\limits_{i=1}^n p_{i,s}x_i}
+$$
+This means that we only have to do a 1-D grid search for $\alpha_s$
+for each $s$ to find the MLEs.
+
+The above formula agrees with the intuition
+of the state observations being "diluted"
+when we compare it to the usual formula for the MLE of the rate
+of a Gamma distribution:
+
+$$
+\hat{\lambda} = \frac{\hat{\alpha}n}{\sum\limits_{i=1}^n x_i}
+$$
+Note that
+
+$$
+\sum_{s=1}^{n_s}\sum_{i=1}^n p_{i,s} = n
+$$
+
+and
+
+$$
+\sum_{s=1}^{n_s}\sum_{i=1}^n p_{i,s}x_i = \sum_{i=1}^n x_i
+$$
+
+```{r cost_distributions}
+enroll_train_with_costs <- readRDS(here("data", "processed",
+                                        "enroll_train_with_costs.rds"))
+cost_names <- readRDS(here("data", "processed", "cost_names.rds"))
+
+enroll_train_with_costs %<>%
+    select(subjid, visdy, all_of(cost_names), total_costs_per_month)
+
+enroll_train_with_fit_and_costs <- left_join(
+    enroll_train_with_fit,
+    enroll_train_with_costs,
+    by = c("subjid", "visdy")
+)
+
+for (cost_name in c(cost_names, 'total_costs_per_month')) {
+    enroll_train_with_fit_and_costs[enroll_train_with_fit_and_costs$age == 0,
+                                    cost_name] <- 0
+}
+
+
+enroll_train_with_fit_and_costs[enroll_train_with_fit_and_costs$age == 0,
+                                'pstate'][[1]] <-
+    cbind(rep(1, sum(enroll_train_with_fit_and_costs$age == 0)),
+          matrix(0, nrow = sum(enroll_train_with_fit_and_costs$age == 0),
+                 ncol = n_hidden_states))
+
+
+# Heuristic method for fitting Gamma distribution to costs given state
+
+prob_state <- enroll_train_with_fit_and_costs$pstate
+costs <- enroll_train_with_fit_and_costs$total_costs_per_month
+costs_p1 <- costs + 1
+
+alpha_MLE <- numeric(n_hidden_states)
+lambda_MLE <- alpha_MLE
+
+for (s in seq_along(alpha_MLE)) {
+    alpha_vec <- 10^seq(0, 3, length.out = 1001)
+    lambda_vec <- alpha_vec * sum(prob_state[, s]) /
+        sum(prob_state[, s] * costs_p1)
+    
+    loglik <- (alpha_vec - 1) * sum(prob_state[, s] * log(costs_p1)) +
+        alpha_vec * log(lambda_vec) * sum(prob_state[, s]) -
+        lambda_vec * sum(prob_state[, s] * costs_p1) -
+        length(costs_p1) * lgamma(alpha_vec)
+    
+    idx_MLE <- which.max(loglik)
+    alpha_MLE[s] <- alpha_vec[idx_MLE]
+    lambda_MLE[s] <- lambda_vec[idx_MLE]
+}
+
+```
+
+
+The plot below shows
+the PDFs of the fitted cost distributions
+for each hidden state in the model.
+We can see that
+the bulk of the probability density
+shifts to the right as we proceed through the states,
+as we would expect.
+
+```{r visualise_cost_distribution_PDFs}
+plot_data <- tibble(
+    cost_p1 = seq(1, 600, length.out = 1001),
+    cost = cost_p1 - 1
+)
+
+for (s in seq_len(n_hidden_states)) {
+    plot_data[paste0('state_', s)] <- dgamma(plot_data$cost_p1,
+                                             alpha_MLE[s], lambda_MLE[s])
+}
+
+plot_data %<>% pivot_longer(all_of(paste0('state_', seq_len(n_hidden_states))),
+                            names_to = 'state',
+                            values_to = 'density')
+
+g <- ggplot(plot_data, aes(x = cost, y = density, colour = state)) +
+    geom_line() +
+    coord_cartesian(ylim = c(-0.0001, 0.005)) +
+    labs(title = "MLE PDFs for total cost per month for each disease state")
+
+print(g)
+```
+
+
+The plot below shows
+the expected monthly cost and a 95% confidence interval
+for each disease state,
+as estimated by our model.
+
+```{r visualise_cost_ranges_per_state}
+alpha <- 0.05
+plot_data <- tibble(
+    state = seq_len(n_hidden_states),
+    mean = alpha_MLE / lambda_MLE,
+    lower = qgamma(alpha/2, shape = alpha_MLE, rate = lambda_MLE),
+    upper = qgamma(alpha/2, shape = alpha_MLE, rate = lambda_MLE, lower.tail = FALSE)
+)
+
+g <- ggplot(plot_data, aes(x = state)) +
+    geom_line(aes(y = mean)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.3) +
+    labs(x = "Disease state",
+         y = "Estimated monthly cost (GBP)",
+         title = "Estimated mean and 95% CI of monthly cost for each disease state")
+
+print(g)
+```
+
+
+The plot below shows
+the breakdown of expected costs
+into each cost item.
+This was produced by looking at the
+mean costs for each cost item
+when the patients were grouped by the most likely state.
+
+```{r expected_costs_per_item}
+gdp_contribution_name <- "Lower contribution to GDP"
+
+enroll_train_with_fit_and_costs %<>%
+    mutate(!!gdp_contribution_name := `cost Contribution to GDP halved` +
+               `cost No contribution to GDP`)
+
+cost_names <- c(
+    setdiff(cost_names, c("cost Contribution to GDP halved", "cost No contribution to GDP")),
+    gdp_contribution_name
+)
+
+expected_costs_by_state <- matrix(0, nrow = length(cost_names),
+                                  ncol = n_hidden_states)
+
+for (i_cost in seq_along(cost_names)) {
+    x <- enroll_train_with_fit_and_costs[[cost_names[i_cost]]]
+    for (j_state in seq_len(n_hidden_states)) {
+        p_ij <- enroll_train_with_fit_and_costs$pstate[, j_state]
+        expected_costs_by_state[i_cost, j_state] <-
+            mean(x * p_ij, na.rm = TRUE) / mean(p_ij, na.rm = TRUE)
+    }
+}
+
+colnames(expected_costs_by_state) <- seq_len(n_hidden_states)
+rownames(expected_costs_by_state) <- cost_names
+
+plot_data <- expected_costs_by_state %>%
+    as_tibble(rownames = "cost_item") %>%
+    pivot_longer(!"cost_item", names_to = "state", values_to = "expected_cost")
+
+g <- ggplot(plot_data,
+            aes(x = state, y = expected_cost, fill = cost_item)) +
+    geom_col(position = "stack", colour = "black")
+
+print(g)
+```
+
+
+```{r costs_aggregated_to_groups}
+expected_costs_grouped <- t(expected_costs_by_state) %>%
+    as_tibble(rownames = "state") %>%
+    group_by(state) %>%
+    summarise(
+        `Universal credit, ESA and PIP` =
+            `cost PIP daily living standard` +
+            `cost PIP daily living enhanced` +
+            `cost PIP mobility standard` +
+            `cost PIP mobility enhanced` +
+            `cost Employment support allowance - low` +
+            `cost Employment support allowance - high` +
+            `cost Universal credit - children` +
+            `cost Universal credit - standard`,
+        `Pharmacologic and non-pharamacologic therapies` =
+            total_expected_cost_per_month_pharma +
+            total_expected_cost_per_month_nonpharma,
+        `Lower contribution to GDP` = `Lower contribution to GDP`,
+        `Partner stops working/care worker/care home` =
+            `cost Partner stops working` +
+            funding_for_care_worker_or_home_per_month +
+            `cost Care home costs - NHS continuing care` +
+            `cost Nursing in care home`,
+        .groups = "drop_last"
+    )
+
+print(expected_costs_grouped)
+
+plot_data <- expected_costs_grouped %>%
+    pivot_longer(!"state", names_to = "cost_item",
+                 values_to = "expected_cost")
+
+g <- ggplot(plot_data,
+            aes(x = state, y = expected_cost, fill = cost_item)) +
+    geom_col(position = "stack", colour = "black")
+
+print(g)
+```
+
+
+## Number of visits and patients with each state
+
+```{r visits_per_state}
+visits_per_state <- enroll_train_with_fit %>%
+    group_by(fitted) %>%
+    summarise(n(), .groups = "drop_last")
+
+visits_per_state
+
+patients_per_state <- enroll_train_with_fit %>%
+    group_by(fitted) %>%
+    summarise(n_patients = n_distinct(subjid),
+              .groups = "drop_last")
+
+patients_per_state
+
+```
+
+## Look at number of distinct states fitted per patient
+
+This table summarises the number of distinct states
+in the patients' fitted state sequences.
+The majority of patients have only 2 distinct states,
+which equates to 1 if you don't count
+the extra observation of state 1 at age 0.
+
+```{r distinct_states}
+enroll_train_with_fit %>%
+    group_by(subjid) %>%
+    summarise(n_distinct_states = n_distinct(fitted), .groups = "drop_last") %>%
+    group_by(n_distinct_states) %>%
+    summarise(n(), .groups = "drop_last")
+
+```
+
+
+## Visit range
+
+This plot shows a histogram of
+the time period covered by each patient's visits.
+We can see that the majority of patients
+have less than 3 years of visits.
+This makes the model difficult to fit,
+because the number of "observed transitions" is very small.
+We plan to try and get more recent data
+so that patients have more visits on average.
+
+```{r visits_range}
+
+plot_data <- enroll_train_with_fit %>%
+    group_by(subjid) %>%
+    summarise(visit_range = max(age[age > 0]) - min(age[age > 0]),
+              .groups = "drop_last")
+
+g <- ggplot(plot_data, aes(x = visit_range)) +
+    geom_histogram(binwidth = 1) +
+    labs(x = "Visit range (years)")
+
+print(g)
+```
+
+
+## Age distribution
+
+This plot shows boxplots of the age distribution
+for visits that have been assigned to each of the states.
+
+```{r age_distn}
+g <- ggplot(enroll_train_with_fit, aes(x = fitted_state, y = age)) +
+    geom_boxplot() +
+    scale_y_continuous(breaks = seq(0, max(enroll_train_with_fit$age), by = 10))
+
+print(g)
+```
+
+
+## Look at interesting example patients
+
+This section shows the fitted state sequences of
+a those patients with at least `r n_states-1` distinct fitted states.
+Note that this is therefore a highly biased sample.
+
+```{r example_patients_tfc, fig.height = 2.5}
+if (n_states > 3) {
+    interesting_patients <- enroll_train_with_fit %>%
+        group_by(subjid) %>%
+        summarise(n_distinct_states = n_distinct(fitted), .groups = "drop_last") %>%
+        filter(n_distinct_states >= n_hidden_states) %>%
+        pull(subjid)
+    
+    enroll_interesting_patients <- enroll_train_with_fit %>%
+        filter(subjid %in% interesting_patients) %>%
+        filter(age > 0)
+    
+    g <- ggplot(enroll_interesting_patients, aes(x = age, y = tfcscore)) +
+        geom_line() +
+        geom_point(aes(colour = fitted_state)) +
+        facet_wrap(vars(subjid), scales = "free_x")
+    
+    print(g)
+}
+```
+
+```{r example_patients_ira, fig.height = 2.5}
+if (n_states > 3) {
+    g <- ggplot(enroll_interesting_patients, aes(x = age, y = irascore_trans)) +
+        geom_line() +
+        geom_point(aes(colour = fitted_state)) +
+        facet_wrap(vars(subjid), scales = "free_x")
+    
+    print(g)
+}
+```
+
+```{r example_patients_pcs, fig.height = 2.5}
+if (n_states > 3) {
+    g <- ggplot(enroll_interesting_patients, aes(x = age, y = observed.pc_1)) +
+        geom_line() +
+        geom_point(aes(colour = fitted_state)) +
+        facet_wrap(vars(subjid), scales = "free_x")
+    
+    print(g)
+    
+    g <- ggplot(enroll_interesting_patients, aes(x = age, y = observed.pc_2)) +
+        geom_line() +
+        geom_point(aes(colour = fitted_state)) +
+        facet_wrap(vars(subjid), scales = "free_x")
+    
+    print(g)
+}
+```
+
+The plots below show
+the estimated probability of each of states 2-5
+for each of the patients shown in the above plot.
+
+```{r state_distribution, fig.height = 2.5}
+if (n_states > 3) {
+    for (i_state in seq_len(n_states)) {
+        enroll_interesting_patients %<>%
+            mutate("pstate_{i_state}" := pstate[, i_state])
+    }
+    
+    plot_data <- enroll_interesting_patients %>%
+        pivot_longer(cols = paste0("pstate_", 2:n_states),
+                     names_to = "state",
+                     values_to = "prob")
+    
+    g <- ggplot(plot_data, aes(x = age, y = prob, colour = state)) +
+        geom_line() +
+        facet_wrap(vars(subjid), scales = "free_x")
+    
+    print(g)
+}
+```
+
+
+## Save msm fitted model and cost parameters
+
+```{r save_model}
+model_path <- here("models", "fitted_Q.csv")
+write.csv(Q_est, model_path, row.names = FALSE)
+
+total_cost_path <- here("models", "total_cost_MLE_fit.csv")
+write.csv(data.frame(alpha_MLE = alpha_MLE, lambda_MLE = lambda_MLE),
+          total_cost_path,
+          row.names = FALSE)
+
+write.csv(expected_costs_by_state,
+          here("models", "expected_costs_by_state.csv"))
+```
