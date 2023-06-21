@@ -1,8 +1,6 @@
 # hda_modelling
 Code for the paper "Data-Driven Huntington’s Disease Progression Modelling and Estimation of Societal Cost in the UK"
 
-Health Economics Modelling for Huntingdon's Disease.
-
 ## Project Organization
 
 ```raw
