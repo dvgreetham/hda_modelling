@@ -1,5 +1,5 @@
 # hda_modelling
-Code for the paper
+Code for the paper "
 
 Health Economics Modelling for Huntingdon's Disease.
 
@@ -44,9 +44,9 @@ Rscript install.R
 In order to completely reproduce the fitted model,
 the following analyses must be run in order:
 
-1. [1_data_preparation/1_prepare_enroll_data](1_data_preparation/1_prepare_enroll_data)
-2. [1_data_preparation/3_link_cost_of_care_to_enroll](1_data_preparation/3_link_cost_of_care_to_enroll)
-3. [2_model_fitting/2_fit_CTHMM_to_enroll_training_set](2_model_fitting/2_fit_CTHMM_to_enroll_training_set)
+1. [1_data_preparation/1_prepare_enroll_data](analysis/1_data_preparation/1_prepare_enroll_data)
+2. [1_data_preparation/3_link_cost_of_care_to_enroll](analysis/1_data_preparation/3_link_cost_of_care_to_enroll)
+3. [2_model_fitting/2_fit_CTHMM_to_enroll_training_set](analysis/2_model_fitting/2_fit_CTHMM_to_enroll_training_set)
 
 N.b. more analyses would need to be run if the data changes
 in order to reassess decisions,
