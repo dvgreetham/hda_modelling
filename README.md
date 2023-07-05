@@ -59,7 +59,7 @@ Rscript install.R
 In order to completely reproduce the fitted model,
 the following analyses must be run in order:
 
-1. [0_data_preparation.ipynb](analysis/0_data_preparation.ipynb)
+1. [0_prepare_data.ipynb](analysis/0_prepare_data.ipynb)
 2. [1_data_preparation/1_prepare_enroll_data](analysis/1_data_preparation/1_prepare_enroll_data)
 3. [1_data_preparation/3_link_cost_of_care_to_enroll](analysis/1_data_preparation/3_link_cost_of_care_to_enroll)
 4. [2_model_fitting/2_fit_CTHMM_to_enroll_training_set](analysis/2_model_fitting/2_fit_CTHMM_to_enroll_training_set)
