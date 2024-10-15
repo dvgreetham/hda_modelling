@@ -1,5 +1,6 @@
 # hda_modelling
 Code for the paper "Data-Driven Huntington’s Disease Progression Modelling and Estimation of Societal Cost in the UK"
+[![DOI](https://zenodo.org/badge/654217980.svg)](https://doi.org/10.5281/zenodo.13934437)
 
 ## Project Organization
 
